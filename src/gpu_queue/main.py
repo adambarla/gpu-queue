@@ -724,11 +724,23 @@ class GPUQueueTUI:
                 # Get GPU status
                 gpu_info = get_free_gpus()
                 
+                # Load config
+                config_file = QUEUE_DIR / "config.json"
+                min_free = 2
+                excluded = []
+                if config_file.exists():
+                    try:
+                        cfg = json.loads(config_file.read_text())
+                        min_free = cfg.get("min_free_gpus", 2)
+                        excluded = cfg.get("excluded_gpus", [])
+                    except: pass
+                
                 with self.lock:
                     self.data = {
                         "queue": data,
                         "gpus": gpu_info,
-                        "min_free": data.get("meta", {}).get("config", {}).get("min_free", 2)
+                        "min_free": min_free,
+                        "excluded": excluded
                     }
                     
                     # Tag jobs with type
