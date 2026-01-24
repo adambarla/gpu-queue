@@ -645,6 +645,44 @@ def cmd_pause(args):
     print(f"Job {args.job_id} not found in running jobs")
 
 
+def cmd_status(args):
+    """Check if the daemon is running."""
+    # Check lock file
+    running = False
+    pid = "unknown"
+    
+    if DAEMON_LOCK_FILE.exists():
+        # Try to acquire lock non-blocking
+        f = open(DAEMON_LOCK_FILE, "w")
+        try:
+             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+             fcntl.flock(f, fcntl.LOCK_UN)
+             # If we can lock it, it means NO ONE else is holding it -> Not Running
+             running = False
+        except BlockingIOError:
+             # Could not lock -> Someone else holds it -> Running
+             running = True
+    
+    if running:
+        if PID_FILE.exists():
+            try:
+                pid = PID_FILE.read_text().strip()
+                # Verify process exists
+                try:
+                    os.kill(int(pid), 0)
+                except OSError:
+                    running = False # Stale lock? Or lock held but pid file wrong?
+                    # Actually if lock is held, process exists. 
+                    pass
+            except: pass
+            
+        print(f"✓ Daemon is RUNNING (PID: {pid})")
+        print(f"  Log: {DAEMON_LOG}")
+    else:
+        print("✗ Daemon is STOPPED")
+
+
+
 class GPUQueueTUI:
     """Interactive Text User Interface for GPU Queue."""
     
@@ -1333,6 +1371,10 @@ def main():
     # stop
     stop_parser = subparsers.add_parser("stop", help="Stop the daemon")
     stop_parser.set_defaults(func=cmd_stop)
+
+    # status
+    status_parser = subparsers.add_parser("status", help="Check if daemon is running")
+    status_parser.set_defaults(func=cmd_status)
 
     # cancel
     cancel_parser = subparsers.add_parser("cancel", help="Cancel a pending job")
