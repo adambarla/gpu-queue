@@ -22,3 +22,19 @@ gpu-queue = "gpu_queue.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gpu_queue"]
+
+[dependency-groups]
+dev = [
+    "ty>=0.0.11",
+    "ruff>=0.1.0",
+    "pre-commit>=4.3.0",
+    "nb-clean>=4.0.0",
+]
+
+[tool.ty]
+
+[tool.ruff]
+src = ["src"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["gpu_queue"]
