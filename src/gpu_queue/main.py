@@ -699,7 +699,10 @@ class GPUQueueTUI:
         self.selected_idx = 0
         
         self.action_msg = ""
+        self.action_msg = ""
         self.msg_clear_time = 0
+        
+        self.confirmation = None # {msg: str, callback: fn}
 
     def get_selected_item(self):
         """Get the currently selected item (job or header)."""
@@ -806,12 +809,8 @@ class GPUQueueTUI:
             return f"{total//3600}h {total%3600//60}m"
         except: return "-"
 
-    def action_cancel(self):
-        """Cancel/Kill selected job."""
-        item = self.get_selected_item()
-        if not item or isinstance(item, str): return
-        job = item
-
+    def _do_cancel(self, job):
+        """Actual cancel implementation."""
         self.action_msg = f"Cancelling {job['id']}..."
         self.msg_clear_time = time.time() + 2
         
@@ -838,6 +837,20 @@ class GPUQueueTUI:
                     return
         
         self.action_msg = f"Job {job['id']} not found"
+
+    def action_cancel(self):
+        """Cancel/Kill selected job."""
+        item = self.get_selected_item()
+        if not item or isinstance(item, str): return
+        job = item
+        
+        def cb():
+            self._do_cancel(job)
+            
+        self.confirmation = {
+            "msg": f"Cancel job {job['id']}? (y/n)",
+            "callback": cb
+        }
 
     def action_retry(self):
         """Retry completed job."""
@@ -1220,6 +1233,36 @@ class GPUQueueTUI:
                 self.stdscr.addstr(detail_y + 1, 2, "Select a job for details.")
         except: pass
 
+        # Confirmation Modal
+        if self.confirmation:
+            msg = self.confirmation["msg"]
+            # Center it
+            box_w = max(40, len(msg) + 4)
+            box_h = 5
+            box_y = (h - box_h) // 2
+            box_x = (w - box_w) // 2
+            
+            # Draw box structure
+            try:
+                # Clear area
+                for i in range(box_h):
+                    self.stdscr.move(box_y + i, box_x)
+                    self.stdscr.addstr(" " * box_w)
+                
+                # Borders
+                self.stdscr.attron(curses.color_pair(3))
+                # Let's manual draw a box
+                self.stdscr.addstr(box_y, box_x, "┌" + "─"*(box_w-2) + "┐")
+                self.stdscr.addstr(box_y+box_h-1, box_x, "└" + "─"*(box_w-2) + "┘")
+                for i in range(1, box_h-1):
+                    self.stdscr.addstr(box_y+i, box_x, "│")
+                    self.stdscr.addstr(box_y+i, box_x+box_w-1, "│")
+                    
+                self.stdscr.addstr(box_y+2, box_x + 2, msg[:box_w-4])
+                self.stdscr.attroff(curses.color_pair(3))
+            except: pass
+            return # Don't draw footer if modal active
+
         help_str = "Q:Quit"
         if selected_item and isinstance(selected_item, dict):
             jtype = selected_item.get("_type")
@@ -1301,6 +1344,15 @@ class GPUQueueTUI:
                 
                 if ch == -1:
                     time.sleep(0.05)
+                    continue
+                
+                if self.confirmation:
+                    # Trapped mode
+                    if ch in [ord('y'), ord('Y'), 10]: # Yes
+                        self.confirmation["callback"]()
+                        self.confirmation = None
+                    elif ch in [ord('n'), ord('N'), 27]: # No
+                         self.confirmation = None
                     continue
                     
                 if ch == ord('q'): break
