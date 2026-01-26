@@ -7,7 +7,7 @@ name = "gpu-queue"
 version = "0.1.0"
 description = "A lightweight GPU job queue scheduler"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = "MIT"
 authors = [
     { name = "Adam Barla", email = "adam.barla@icloud.com" },
