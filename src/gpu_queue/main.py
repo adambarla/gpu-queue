@@ -1100,7 +1100,7 @@ class GPUQueueTUI:
             gpu_h = 0
             if not self.windows[3].collapsed:
                 gpu_content_len = len(self.gpu_status) if self.gpu_status else 1
-                gpu_h = min(gpu_content_len + 2, avail_h // 3)  # Cap at 1/3
+                gpu_h = min(gpu_content_len + 3, avail_h // 3)  # +3 for Border(2) + Header(1)
                 gpu_h = max(3, gpu_h)  # Min height
             else:
                 gpu_h = 1
@@ -1110,7 +1110,7 @@ class GPUQueueTUI:
             if not self.windows[0].collapsed:
                 running_items = len(self.data.get("running", []))
                 running_content_len = running_items + 1  # +1 for header
-                running_h = min(running_content_len + 2, avail_h // 3)
+                running_h = min(running_content_len + 3, avail_h // 3)
                 running_h = max(3, running_h)
             else:
                 running_h = 1
