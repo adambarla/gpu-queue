@@ -1054,10 +1054,10 @@ class GPUQueueTUI:
             self.stdscr.hline(0, 0, " ", w, curses.color_pair(6) | curses.A_REVERSE)
 
             status_col = curses.color_pair(6) | curses.A_REVERSE  # White BG
-            
+
             # Title
             self.stdscr.addstr(0, 1, " GPU QUEUE WATCH ", status_col | curses.A_BOLD)
-            
+
             # Daemon Status
             server_col = (
                 curses.color_pair(2 if "ON" in self.server_status else 1)
@@ -1072,10 +1072,10 @@ class GPUQueueTUI:
             if self.excluded:
                 ex_list = ",".join(map(str, sorted(self.excluded)))
                 info_str += f" | Excl: [{ex_list}]"
-            
+
             # Right aligned info
             info_x = w - len(info_str) - 2
-            if info_x > 40: # Prevent overlap
+            if info_x > 40:  # Prevent overlap
                 self.stdscr.addstr(0, info_x, info_str, status_col)
 
             # Action message overlay
@@ -1298,7 +1298,9 @@ class GPUQueueTUI:
                 return
 
             # Column headers
-            header = "IDX  UTIL  MEM_USAGE      PROCESSES (USER:PID)"
+            # Column headers
+            # IDX:0, UTIL:5, MEM:10, PROCS:26
+            header = "IDX  UTIL MEM            PROCESSES (USER:PID)"
             if w > 30:
                 self.stdscr.addstr(
                     y, x + 2, header[: w - 4], curses.A_DIM | curses.A_UNDERLINE
@@ -1331,11 +1333,11 @@ class GPUQueueTUI:
                 ]
                 proc_line = ", ".join(proc_strs)
 
-                avail_proc_w = w - 24
+                avail_proc_w = w - 28
                 if len(proc_line) > avail_proc_w:
                     proc_line = proc_line[: avail_proc_w - 3] + "..."
 
-                self.stdscr.addstr(line_y, x + 22, proc_line, curses.A_DIM)
+                self.stdscr.addstr(line_y, x + 28, proc_line, curses.A_DIM)
         except Exception:
             pass
 
@@ -1436,7 +1438,7 @@ class GPUQueueTUI:
             header_offset = 1
             hdr = ""
             if win.key == "running":
-                hdr = " ID       PID      GPUS     ELAPSED   CMD"
+                hdr = " ID       PID   GPUS    ELAPSED  CMD"
             elif win.key == "pending":
                 hdr = " ID       GPUS   PRIO     WAITING   CMD"
             elif win.key == "completed":
