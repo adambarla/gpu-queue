@@ -1703,9 +1703,9 @@ class GPUQueueTUI:
                 if self.viewing_logs:
                     if ch == 27 or ch == ord("h") or ch == ord("q"):  # Esc or h or q
                         self.viewing_logs = False
-                    elif ch == curses.KEY_UP:
+                    elif ch == curses.KEY_UP or ch == ord("k"):
                         self.log_scroll = max(0, self.log_scroll - 1)
-                    elif ch == curses.KEY_DOWN:
+                    elif ch == curses.KEY_DOWN or ch == ord("j"):
                         max_scroll = max(
                             0, len(self.log_content) - (self.stdscr.getmaxyx()[0] - 6)
                         )
