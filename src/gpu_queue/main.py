@@ -426,6 +426,8 @@ def daemon_loop(min_free, excluded_gpus=None):
                         status_data = {
                             "ts": datetime.now().isoformat(),
                             "gpus": all_gpus,
+                            "min_free": min_free,
+                            "excluded": list(excluded_gpus),
                         }
                         (QUEUE_DIR / "status.json").write_text(json.dumps(status_data))
                     except Exception:
@@ -436,6 +438,8 @@ def daemon_loop(min_free, excluded_gpus=None):
                         status_data = {
                             "ts": datetime.now().isoformat(),
                             "gpus": all_gpus,
+                            "min_free": min_free,
+                            "excluded": list(excluded_gpus),
                         }
                         (QUEUE_DIR / "status.json").write_text(json.dumps(status_data))
                     except Exception:
@@ -797,7 +801,10 @@ class GPUQueueTUI:
 
         # State
         self.data = {"running": [], "pending": [], "completed": []}
+        self.data = {"running": [], "pending": [], "completed": []}
         self.gpu_status = []
+        self.min_free = 2
+        self.excluded = []
         self.server_status = "UNKNOWN"
         self.last_updated = 0
         self.action_msg = ""
@@ -877,6 +884,8 @@ class GPUQueueTUI:
                             s = json.loads(txt)
                             with self.lock:
                                 self.gpu_status = s.get("gpus", [])
+                                self.min_free = s.get("min_free", 2)
+                                self.excluded = s.get("excluded", [])
                                 self.server_status = "DAEMON: ON"
                         else:
                             with self.lock:
@@ -1040,16 +1049,34 @@ class GPUQueueTUI:
 
         with self.lock:
             # 0. Header (1 row)
-            status_col = curses.color_pair(6)  # White
-            server_col = (
-                curses.color_pair(2)
-                if "ON" in self.server_status
-                else curses.color_pair(1)
-            )
+            # 0. Header (1 row)
+            # Full width white bar
+            self.stdscr.hline(0, 0, " ", w, curses.color_pair(6) | curses.A_REVERSE)
+
+            status_col = curses.color_pair(6) | curses.A_REVERSE  # White BG
+            
+            # Title
             self.stdscr.addstr(0, 1, " GPU QUEUE WATCH ", status_col | curses.A_BOLD)
+            
+            # Daemon Status
+            server_col = (
+                curses.color_pair(2 if "ON" in self.server_status else 1)
+                | curses.A_REVERSE
+            )
             self.stdscr.addstr(
                 0, 20, f" [{self.server_status}] ", server_col | curses.A_BOLD
             )
+
+            # Daemon Info (Reserved/Excluded)
+            info_str = f"Res: {self.min_free}"
+            if self.excluded:
+                ex_list = ",".join(map(str, sorted(self.excluded)))
+                info_str += f" | Excl: [{ex_list}]"
+            
+            # Right aligned info
+            info_x = w - len(info_str) - 2
+            if info_x > 40: # Prevent overlap
+                self.stdscr.addstr(0, info_x, info_str, status_col)
 
             # Action message overlay
             if self.action_msg:
