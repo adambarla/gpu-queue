@@ -1467,12 +1467,10 @@ class GPUQueueTUI:
 
             help_str = " Q:Quit "
             if self.mode == "NAV":
-                help_str += (
-                    "Arrows/j/k:Select Window  Enter:Focus  [:Collapse  ]:Uncollapse"
-                )
+                help_str += "j/k:Select  l/Ent:Focus  n:New Job  Tab:Collapse"
             else:
                 help_str += (
-                    "Esc:Bak Spc:Log c:Can +/-:Prio g:Gpus r:Rem d:Dup n:New p:Pau"
+                    "h/Esc:Back  Spc:Log  c:Cancel  r:Rem  d:Dup  p:Pause  +/-:Prio"
                 )
 
             # Mode display on the right
@@ -1530,7 +1528,7 @@ class GPUQueueTUI:
                 )
 
             # Footer
-            footer_str = " Esc:Close  Arr:Scroll  PGUP/DN:Jump  L:Full(less) "
+            footer_str = " h/Esc:Close  j/k:Scroll  PGUP/DN:Jump  L:Full(less) "
             self.stdscr.addstr(
                 margin_y + win_h - 1, margin_x + 2, footer_str, curses.A_REVERSE
             )
@@ -1703,9 +1701,7 @@ class GPUQueueTUI:
 
                 # Log Viewing Mode
                 if self.viewing_logs:
-                    if (
-                        ch == 27 or ch == ord("l") or ch == ord("q") or ch == ord(" ")
-                    ):  # Esc or l or q
+                    if ch == 27 or ch == ord("h") or ch == ord("q"):  # Esc or h or q
                         self.viewing_logs = False
                     elif ch == curses.KEY_UP:
                         self.log_scroll = max(0, self.log_scroll - 1)
@@ -1739,15 +1735,15 @@ class GPUQueueTUI:
                         self.active_win_idx = min(
                             len(self.windows) - 1, self.active_win_idx + 1
                         )
-                    elif ch == 10:  # Enter
-                        # Disable Enter for non-interactive windows
+                    elif ch == 10 or ch == ord("l"):  # Enter or l
+                        # Disable Enter/l for non-interactive windows
                         curr_win = self.windows[self.active_win_idx]
                         if curr_win.key not in ["gpu_status", "job_details"]:
                             self.mode = "ACTION"
-                    elif ch == ord("["):  # Collapse
-                        self.windows[self.active_win_idx].collapsed = True
-                    elif ch == ord("]"):  # Uncollapse
-                        self.windows[self.active_win_idx].collapsed = False
+                    elif ch == 9:  # Tab
+                        self.windows[self.active_win_idx].collapsed = not self.windows[
+                            self.active_win_idx
+                        ].collapsed
                     elif ch == ord("n"):  # New Job (Global context)
                         self.prompt_new_job()
 
@@ -1755,7 +1751,7 @@ class GPUQueueTUI:
                     win = self.windows[self.active_win_idx]
                     h = (self.stdscr.getmaxyx()[0] - 5) // 3  # approx height per window
 
-                    if ch == 27:  # Esc
+                    if ch == 27 or ch == ord("h"):  # Esc or h
                         self.mode = "NAV"
                         # Reset scroll to top
                         win.scroll_offset = 0
@@ -1764,7 +1760,7 @@ class GPUQueueTUI:
                         win.scroll(-1, h)
                     elif ch == curses.KEY_DOWN or ch == ord("j"):
                         win.scroll(1, h)
-                    elif ch == ord(" ") or ch == ord("l"):
+                    elif ch == ord(" "):
                         self.action_view_logs()
                     elif ch == ord("L"):
                         self.action_open_external_logs()
