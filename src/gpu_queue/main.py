@@ -1100,7 +1100,9 @@ class GPUQueueTUI:
             gpu_h = 0
             if not self.windows[3].collapsed:
                 gpu_content_len = len(self.gpu_status) if self.gpu_status else 1
-                gpu_h = min(gpu_content_len + 3, avail_h // 3)  # +3 for Border(2) + Header(1)
+                gpu_h = min(
+                    gpu_content_len + 3, avail_h // 3
+                )  # +3 for Border(2) + Header(1)
                 gpu_h = max(3, gpu_h)  # Min height
             else:
                 gpu_h = 1
@@ -1496,11 +1498,9 @@ class GPUQueueTUI:
 
             help_str = " Q:Quit "
             if self.mode == "NAV":
-                help_str += "j/k:Select  l/Ent:Focus  n:New Job  Tab:Collapse"
+                help_str += "j/k:Select  l:Focus  n:New Job  Tab:Collapse"
             else:
-                help_str += (
-                    "h/Esc:Back  Spc:Log  c:Cancel  r:Rem  d:Dup  p:Pause  +/-:Prio"
-                )
+                help_str += "h:Back  Spc:Log  c:Cancel  r:Rem  d:Dup  p:Pause  +/-:Prio"
 
             # Mode display on the right
             mode_s = f" MODE: {self.mode} "
@@ -1730,27 +1730,15 @@ class GPUQueueTUI:
 
                 # Log Viewing Mode
                 if self.viewing_logs:
-                    if ch == 27 or ch == ord("h") or ch == ord("q"):  # Esc or h or q
+                    if ch == ord("h") or ch == ord("q"):  # h or q
                         self.viewing_logs = False
-                    elif ch == curses.KEY_UP or ch == ord("k"):
+                    elif ch == ord("k"):
                         self.log_scroll = max(0, self.log_scroll - 1)
-                    elif ch == curses.KEY_DOWN or ch == ord("j"):
+                    elif ch == ord("j"):
                         max_scroll = max(
                             0, len(self.log_content) - (self.stdscr.getmaxyx()[0] - 6)
                         )
                         self.log_scroll = min(max_scroll, self.log_scroll + 1)
-                    elif ch == curses.KEY_PPAGE:
-                        self.log_scroll = max(
-                            0, self.log_scroll - (self.stdscr.getmaxyx()[0] - 6)
-                        )
-                    elif ch == curses.KEY_NPAGE:
-                        max_scroll = max(
-                            0, len(self.log_content) - (self.stdscr.getmaxyx()[0] - 6)
-                        )
-                        self.log_scroll = min(
-                            max_scroll,
-                            self.log_scroll + (self.stdscr.getmaxyx()[0] - 6),
-                        )
                     continue
 
                 # Normal Mode
@@ -1758,14 +1746,14 @@ class GPUQueueTUI:
                     break
 
                 if self.mode == "NAV":
-                    if ch == curses.KEY_UP or ch == ord("k"):
+                    if ch == ord("k"):
                         self.active_win_idx = max(0, self.active_win_idx - 1)
-                    elif ch == curses.KEY_DOWN or ch == ord("j"):
+                    elif ch == ord("j"):
                         self.active_win_idx = min(
                             len(self.windows) - 1, self.active_win_idx + 1
                         )
-                    elif ch == 10 or ch == ord("l"):  # Enter or l
-                        # Disable Enter/l for non-interactive windows
+                    elif ch == ord("l"):  # l
+                        # Disable l for non-interactive windows
                         curr_win = self.windows[self.active_win_idx]
                         if curr_win.key not in ["gpu_status", "job_details"]:
                             self.mode = "ACTION"
@@ -1780,14 +1768,14 @@ class GPUQueueTUI:
                     win = self.windows[self.active_win_idx]
                     h = (self.stdscr.getmaxyx()[0] - 5) // 3  # approx height per window
 
-                    if ch == 27 or ch == ord("h"):  # Esc or h
+                    if ch == ord("h"):  # h
                         self.mode = "NAV"
                         # Reset scroll to top
                         win.scroll_offset = 0
                         win.selected_idx = 0
-                    elif ch == curses.KEY_UP or ch == ord("k"):
+                    elif ch == ord("k"):
                         win.scroll(-1, h)
-                    elif ch == curses.KEY_DOWN or ch == ord("j"):
+                    elif ch == ord("j"):
                         win.scroll(1, h)
                     elif ch == ord(" "):
                         self.action_view_logs()
