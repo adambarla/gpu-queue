@@ -1415,11 +1415,15 @@ class GPUQueueTUI:
             self.stdscr.attroff(color)
 
             # Title
-            title_s = f" {win.title} "
+            count_str = ""
+            if win.key in ["running", "pending", "completed"]:
+                count_str = f"[{len(win.items)}]"
+
+            title_s = f" {win.title} {count_str} "
             if win.collapsed:
-                title_s = f" [+] {win.title} "
+                title_s = f" [+] {win.title} {count_str} "
             elif focused:
-                title_s = f" [ {win.title} ] "
+                title_s = f" [ {win.title} {count_str} ] "
 
             style = curses.A_BOLD if active else 0
             # Use white for title text as requested
@@ -1581,8 +1585,31 @@ class GPUQueueTUI:
         log_path = Path.home() / f".gpu_queue/logs/{self.log_job_id}.log"
         if log_path.exists():
             try:
-                with open(log_path) as f:
-                    self.log_content = [line.rstrip() for line in f.readlines()]
+                # Read binary to handle decoding carefully if needed, or just text
+                raw_text = log_path.read_text(errors="replace")
+                
+                # TQDM Handling: Split by lines, then process \r
+                lines = raw_text.splitlines()
+                final_lines = []
+                for line in lines:
+                    # If line contains \r, it's likely a progress bar update.
+                    # We want the last segment after the last \r
+                    if "\r" in line:
+                         # Split by \r
+                         parts = line.split("\r")
+                         # Take the last non-empty part if possible, or just the last part
+                         # TQDM typically does: "0%|...|\r10%|...|\r..."
+                         # so getting the last part usually gives the latest state.
+                         # But sometimes \r is at the end, so we might get empty.
+                         content = parts[-1]
+                         if not content and len(parts) > 1:
+                             content = parts[-2]
+                         if content:
+                             final_lines.append(content)
+                    else:
+                        final_lines.append(line)
+                
+                self.log_content = final_lines
             except Exception:
                 self.log_content = ["Error reading log file."]
         else:
