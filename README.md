@@ -46,6 +46,14 @@ A lightweight job queue for shared GPU servers without SLURM.
     - `p`: Pause/Resume running job
     - `r`: Remove completed job
 
+    **Interactive Editing**:
+    - **Enter Edit Mode**: Press `e` on a pending job or `d` to duplicate.
+    - **Navigation**: Use `h`/`l` to switch between GPUs, Priority, and Command fields.
+    - **Modify Values**: Use `j`/`k` to increase/decrease values.
+    - **Edit Command**: Select the Command field and press `Enter` to open your system editor.
+    - **Confirm**: Press `e` to save changes.
+    - **Cancel**: Press `Esc` to discard changes.
+
 ## Development Setup
 
 1.  **Install Dev Dependencies**:
