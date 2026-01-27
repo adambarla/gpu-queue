@@ -25,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -765,17 +766,22 @@ class Window:
         if self.scroll_offset >= len(self.items):
             self.scroll_offset = max(0, len(self.items) - 1)
 
-    def scroll(self, delta, h):
+    def scroll(self, delta, h=None):
         """Scroll selection by delta."""
         if not self.items:
             return
+
+        # Use stored height if available (more accurate), otherwise fallback
+        effective_h = getattr(self, "height", h)
+        if effective_h is None:
+            effective_h = 10  # Fallback
 
         new_idx = self.selected_idx + delta
         self.selected_idx = max(0, min(len(self.items) - 1, new_idx))
 
         # Adjust scroll offset to keep selected item in view
         # visible items = h - 2 (border)
-        visible_h = max(1, h - 2)
+        visible_h = max(1, effective_h - 2)
 
         # Account for header in list windows
         if self.key in ["running", "pending", "completed"]:
@@ -827,6 +833,12 @@ class GPUQueueTUI:
         self.log_job_id = None
         self.log_content = []
         self.log_scroll = 0
+
+        # Edit Mode State
+        self.edit_mode_active = False
+        self.edit_job = None
+        self.edit_field_idx = 0  # 0: GPUs, 1: Priority, 2: Command
+        self.edit_is_new = False
 
     def start(self):
         self.running = True
@@ -968,6 +980,10 @@ class GPUQueueTUI:
         """Format a job dictionary into a single line string."""
         jid = job["id"]
 
+        # Edit Mode Highlighting
+        edit_idx = job.get("_edit_field_idx", -1)
+        is_editing = edit_idx >= 0
+
         # Determine Color based on state/status
         color = curses.color_pair(0)
 
@@ -994,7 +1010,7 @@ class GPUQueueTUI:
             # Format: ID(8) | PRIO(6) | WAITING(9) | CMD
             # Pending items usually white.
 
-            gpus = job.get("gpus", 1)
+            gpus = str(job.get("gpus", 1))
             p = job.get("priority", 1)
             p_s = ["L", "M", "H", "U"][min(p, 3)]
 
@@ -1002,6 +1018,22 @@ class GPUQueueTUI:
             add_dt = self._parse_iso(job.get("added"))
             if add_dt:
                 waiting = self._fmt_delta(datetime.now() - add_dt)
+
+            # Construct fields individually for highlighting
+            # available_width = max_width - fixed_columns
+            # Highlighting enabled by wrapping active field
+
+            # To ensure visibility if colors fail, let's add markers or brackets?
+            # But brackets change length.
+            # Maybe just keep exact length but use background color.
+            # User said "definitely not blinking and don't know what field".
+            # So let's use brackets OR arrows if length permits.
+            # Changing length breaks column alignment unless we account for it.
+            # Simple approach: Return exact same string length but rely heavily on REVERSE.
+
+            # Wait, if we use segments, we can just rely on REVERSE.
+            # If REVERSE isn't showing, maybe the terminal is weird.
+            # Let's try adding explicit indicators.
 
             prefix = f" {jid:<8} {gpus:<6} {p_s:<8} {waiting:<9} "
 
@@ -1037,7 +1069,48 @@ class GPUQueueTUI:
         if len(cmd) > avail_cmd:
             cmd = cmd[: (avail_cmd - 1)] + "…"
 
-        return prefix + cmd, color
+        full_line = prefix + cmd
+
+        if is_editing and job["_type"] == "pending":
+            # Use Brackets for visibility even if colors fail
+            # We need to construct segments with markers
+
+            # Field 0: GPUS. Width 6.
+            s_gpus = f"{gpus:<6} "
+            if edit_idx == 0:
+                s_gpus = f"[{gpus}]".ljust(7)  # Makes it slightly wider? No good.
+                # Keep width 7 (6+1 space)
+                # {gpus} is e.g. "1" (len 1). "1     "
+                # "[1]   "
+                s_val = f"[{gpus}]"
+                s_gpus = f"{s_val:<7}"
+            else:
+                s_gpus = f"{gpus:<6} "
+
+            # Field 1: PRIO. Width 8.
+            # {p_s} e.g. "L"
+            if edit_idx == 1:
+                s_val = f"[{p_s}]"
+                s_prio = f"{s_val:<9}"
+            else:
+                s_prio = f"{p_s:<8} "
+
+            # Field 2: CMD.
+            # Just highlight it.
+
+            return {
+                "type": "rich",
+                "segments": [
+                    (f" {jid:<8} ", curses.A_NORMAL),
+                    (s_gpus, curses.A_REVERSE if edit_idx == 0 else curses.A_NORMAL),
+                    (s_prio, curses.A_REVERSE if edit_idx == 1 else curses.A_NORMAL),
+                    (f"{waiting:<9} ", curses.A_NORMAL),
+                    (cmd, curses.A_REVERSE if edit_idx == 2 else curses.A_NORMAL),
+                ],
+                "base_color": color | curses.A_BLINK,
+            }, color
+
+        return full_line, color
 
     def draw(self):
         self.stdscr.erase()
@@ -1150,6 +1223,7 @@ class GPUQueueTUI:
             current_y = 1
             for i, win in enumerate(self.windows):
                 wh = heights[i]
+                win.height = wh  # Store actual height for scrolling
                 if wh <= 0:
                     continue  # Skip hidden windows
 
@@ -1263,7 +1337,10 @@ class GPUQueueTUI:
                         line_content = ""
 
                         # Only draw if valid line or active cursor line
-                        self.stdscr.addstr(draw_y, x + 3, line_content)
+                        # Use White (pair 6) for input text
+                        self.stdscr.addstr(
+                            draw_y, x + 3, line_content, curses.color_pair(6)
+                        )
 
                     # Cursor
                     if line_idx == c_row:
@@ -1277,7 +1354,10 @@ class GPUQueueTUI:
                             char_at = line_content[c_col]
 
                         self.stdscr.addstr(
-                            draw_y, x + 3 + c_col, char_at, curses.A_REVERSE
+                            draw_y,
+                            x + 3 + c_col,
+                            char_at,
+                            curses.A_REVERSE | curses.color_pair(6),
                         )
 
             # Buttons
@@ -1376,10 +1456,26 @@ class GPUQueueTUI:
             self.stdscr.addstr(y, x + 2, meta_str, curses.A_BOLD)
 
             cmd = job.get("cmd", "")
-            prefix = "Cmd: "
-            avail_w = w - 4 - len(prefix)
+            # Normalize command (remove newlines)
+            cmd = cmd.replace("\n", " ").replace("\r", " ")
 
-            lines = [cmd[i : i + avail_w] for i in range(0, len(cmd), avail_w)]
+            prefix = "Cmd: "
+            # Safer width calc: W - Left(2) - Right(2) - ScrollBar(1) - Prefix - Safety(2)
+            # w - 5 - len(prefix) ?
+            # w is Full Width.
+            # Draws at x+2.
+            # Max index w-2 (border at w-1).
+            # So length available = w-4.
+            # Subtract prefix.
+            # Subtract 2 more for safety.
+            safe_width = w - 6 - len(prefix)
+            if safe_width < 10:
+                safe_width = 10
+
+            import textwrap
+
+            lines = textwrap.wrap(cmd, width=safe_width)
+
             for i, line in enumerate(lines[: h - 1]):
                 self.stdscr.addstr(
                     y + 1 + i,
@@ -1454,34 +1550,105 @@ class GPUQueueTUI:
                 self.stdscr.addstr(y + 1, 1, hdr, curses.A_DIM | curses.A_UNDERLINE)
 
             # List items
+            display_items = list(win.items)
+
+            # 1. NEW EDIT JOB INJECTION
+            if (
+                active
+                and self.edit_mode_active
+                and self.edit_is_new
+                and self.edit_job
+                and win.key == "pending"
+            ):
+                self.edit_job["_edit_field_idx"] = self.edit_field_idx
+                target_idx = win.selected_idx + 1
+                if target_idx <= len(display_items):
+                    display_items.insert(target_idx, self.edit_job)
+
+            # 2. EXISTING JOB SWAP
+            elif (
+                active
+                and self.edit_mode_active
+                and not self.edit_is_new
+                and self.edit_job
+                and win.key == "pending"
+            ):
+                # Find the job in display_items and replace it
+                self.edit_job["_edit_field_idx"] = self.edit_field_idx
+                for idx, it in enumerate(display_items):
+                    if it["id"] == self.edit_job["id"]:
+                        display_items[idx] = self.edit_job
+                        break
+
+            # Recalculate list height or just use what we have
             list_h = h - 2 - header_offset
             if list_h < 1:
                 return
 
             start_y = y + 1 + header_offset
 
-            visible_items = win.items[win.scroll_offset : win.scroll_offset + list_h]
+            # We need to handle scroll offset carefully if we injected an item
+            # If we injected, the list is 1 longer.
+            visible_items = display_items[
+                win.scroll_offset : win.scroll_offset + list_h
+            ]
 
             for i, item in enumerate(visible_items):
                 abs_idx = win.scroll_offset + i
-                is_sel = active and abs_idx == win.selected_idx
 
-                line_str, line_col = self.format_job_line(item, w - 2)
+                # Check if this is the injected item
+                is_injected = item.get("id") == "EDITING"
+
+                # Selection logic:
+                # If editing new job, visual selection is on injected item (rel idx + 1)
+
+                is_sel = False
+                if active:
+                    if (
+                        self.edit_mode_active
+                        and self.edit_is_new
+                        and win.key == "pending"
+                    ):
+                        if abs_idx == win.selected_idx + 1:
+                            is_sel = True
+                    else:
+                        if abs_idx == win.selected_idx:
+                            is_sel = True
+
+                line_res, line_col = self.format_job_line(item, w - 2)
 
                 draw_style = curses.A_NORMAL
                 if is_sel:
-                    if focused:
+                    if focused and not is_injected:
                         draw_style = curses.A_REVERSE
                     else:
-                        # In NAV mode, just highlight window
+                        # In NAV mode, pass or different style
                         pass
 
-                self.stdscr.addstr(start_y + i, 1, line_str, line_col | draw_style)
+                # Handle Rich Text (Dictionary)
+                if isinstance(line_res, dict) and line_res.get("type") == "rich":
+                    current_x = 1
+                    segments = line_res["segments"]
+                    base_attr = line_res.get("base_color", curses.A_NORMAL)
+
+                    # Clear line with base attr first?
+                    # self.stdscr.addstr(start_y + i, 1, " " * (w-2), base_attr)
+
+                    for text, attr in segments:
+                        try:
+                            self.stdscr.addstr(
+                                start_y + i, current_x, text, attr | base_attr
+                            )
+                            current_x += len(text)
+                        except Exception:
+                            pass
+                else:
+                    self.stdscr.addstr(start_y + i, 1, line_res, line_col | draw_style)
 
             # Scroll bar indicator?
-            if len(win.items) > list_h:
-                sb_h = max(1, int(list_h * (list_h / len(win.items))))
-                sb_pos = int((win.scroll_offset / len(win.items)) * list_h)
+            if len(display_items) > list_h:
+                sb_h = max(1, int(list_h * (list_h / len(display_items))))
+                sb_pos = int((win.scroll_offset / len(display_items)) * list_h)
                 for k in range(list_h):
                     char = "│"
                     if k >= sb_pos and k < sb_pos + sb_h:
@@ -1490,7 +1657,6 @@ class GPUQueueTUI:
                         self.stdscr.addstr(start_y + k, w - 1, char, color)
                     except Exception:
                         pass
-
         except Exception:
             # self.stdscr.addstr(y+1, 1, str(e))
             pass
@@ -1501,13 +1667,23 @@ class GPUQueueTUI:
                 return  # Don't draw footer over modal or distract
 
             help_str = " Q:Quit "
-            if self.mode == "NAV":
+            if self.edit_mode_active:
+                help_str += (
+                    "e:Confirm  Esc:Cancel  h/l:Field  j/k:Value  Enter:Edit Command"
+                )
+            elif self.mode == "NAV":
                 help_str += "j/k:Select  l:Focus  n:New Job  Tab:Collapse"
             else:
-                help_str += "h:Back  Spc:Log  c:Cancel  r:Rem  d:Dup  p:Pause  +/-:Prio"
+                help_str += (
+                    "h:Back  Space:Log  c:Cancel  r:Remove  d:Duplicate  p:Pause"
+                )
 
             # Mode display on the right
-            mode_s = f" MODE: {self.mode} "
+            mode_label = self.mode
+            if self.edit_mode_active:
+                mode_label = "EDIT"
+
+            mode_s = f" MODE: {mode_label} "
             padding = " " * (w - len(help_str) - len(mode_s))
 
             full_str = help_str + padding + mode_s
@@ -1570,59 +1746,13 @@ class GPUQueueTUI:
             pass
 
     def action_view_logs(self):
-        if self.mode != "ACTION":
-            return
+        """View logs for selected job using external tool."""
         win = self.windows[self.active_win_idx]
         job = win.get_selected()
         if not job:
             return
 
-        self.log_job_id = job["id"]
-        self.viewing_logs = True
-        self.log_scroll = 0
-
-        # Load logs (naive read)
-        log_path = Path.home() / f".gpu_queue/logs/{self.log_job_id}.log"
-        if log_path.exists():
-            try:
-                # Read binary to handle decoding carefully if needed, or just text
-                raw_text = log_path.read_text(errors="replace")
-                
-                # TQDM Handling: Split by lines, then process \r
-                lines = raw_text.splitlines()
-                final_lines = []
-                for line in lines:
-                    # If line contains \r, it's likely a progress bar update.
-                    # We want the last segment after the last \r
-                    if "\r" in line:
-                         # Split by \r
-                         parts = line.split("\r")
-                         # Take the last non-empty part if possible, or just the last part
-                         # TQDM typically does: "0%|...|\r10%|...|\r..."
-                         # so getting the last part usually gives the latest state.
-                         # But sometimes \r is at the end, so we might get empty.
-                         content = parts[-1]
-                         if not content and len(parts) > 1:
-                             content = parts[-2]
-                         if content:
-                             final_lines.append(content)
-                    else:
-                        final_lines.append(line)
-                
-                self.log_content = final_lines
-            except Exception:
-                self.log_content = ["Error reading log file."]
-        else:
-            self.log_content = ["Log file not found."]
-
-        # If empty
-        if not self.log_content:
-            self.log_content = ["<Empty log>"]
-
-        # Auto scroll to bottom
-        content_h = self.stdscr.getmaxyx()[0] - 6  # approx
-        if len(self.log_content) > content_h:
-            self.log_scroll = len(self.log_content) - content_h
+        self.action_open_external_logs()
 
     def action_open_external_logs(self):
         """Open logs in an external tool (less +F)."""
@@ -1651,7 +1781,13 @@ class GPUQueueTUI:
             if job["_type"] == "running":
                 cmd = ["less", "+F", str(log_path)]
 
-            subprocess.run(cmd)
+            # Ignore SIGINT in parent (Python) so Ctrl+C only kills 'less'
+            old_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                subprocess.run(cmd)
+            finally:
+                # Restore SIGINT handler
+                signal.signal(signal.SIGINT, old_handler)
         finally:
             # Re-enter curses
             self.stdscr.refresh()
@@ -1755,9 +1891,65 @@ class GPUQueueTUI:
                             m["cursor_pos"] = cpos + 1
                     continue
 
+                if self.edit_mode_active:
+                    # Force redraw of footer/status
+                    # self.stdscr.touchwin()
+
+                    if ch == 27:  # Esc -> Cancel
+                        self.edit_mode_active = False
+                        self.edit_job = None
+                    elif ch == ord("e"):  # Confirm
+                        if self.edit_is_new:
+                            self.add_job_internal(
+                                self.edit_job["cmd"],
+                                self.edit_job["gpus"],
+                                self.edit_job["priority"],
+                            )
+                        else:
+                            # Update existing job
+                            self.execute_action(
+                                "update_job",
+                                self.edit_job["id"],
+                                cmd=self.edit_job["cmd"],
+                                gpus=self.edit_job["gpus"],
+                                priority=self.edit_job["priority"],
+                            )
+                        self.edit_mode_active = False
+                        self.edit_job = None
+
+                    elif ch == ord("h"):  # Cycle Left
+                        self.edit_field_idx = max(0, self.edit_field_idx - 1)
+                    elif ch == ord("l"):  # Cycle Right
+                        self.edit_field_idx = min(2, self.edit_field_idx + 1)
+
+                    elif ch == ord("j"):  # Decrease Value
+                        if self.edit_field_idx == 0:  # GPUS
+                            self.edit_job["gpus"] = max(
+                                1, int(self.edit_job["gpus"]) - 1
+                            )
+                        elif self.edit_field_idx == 1:  # Prio
+                            self.edit_job["priority"] = max(
+                                1, int(self.edit_job["priority"]) - 1
+                            )
+
+                    elif ch == ord("k"):  # Increase Value
+                        if self.edit_field_idx == 0:  # GPUS
+                            self.edit_job["gpus"] = int(self.edit_job["gpus"]) + 1
+                            # Assuming no hard max, or maybe max_gpus from status?
+                        elif self.edit_field_idx == 1:  # Prio
+                            self.edit_job["priority"] = min(
+                                3, int(self.edit_job["priority"]) + 1
+                            )
+
+                    elif ch == 10 or ch == ord("i"):  # Enter/Edit Text
+                        if self.edit_field_idx == 2:  # Command
+                            self.prompt_edit_command()
+
+                    continue
+
                 # Log Viewing Mode
                 if self.viewing_logs:
-                    if ch == ord("h") or ch == ord("q"):  # h or q
+                    if ch == ord("h") or ch == ord("q") or ch == 27:  # h or q or Esc
                         self.viewing_logs = False
                     elif ch == ord("k"):
                         self.log_scroll = max(0, self.log_scroll - 1)
@@ -1784,6 +1976,12 @@ class GPUQueueTUI:
                         curr_win = self.windows[self.active_win_idx]
                         if curr_win.key not in ["gpu_status", "job_details"]:
                             self.mode = "ACTION"
+                            curr_win.collapsed = False
+                    elif ch == 10:  # Enter
+                        curr_win = self.windows[self.active_win_idx]
+                        if curr_win.key not in ["gpu_status", "job_details"]:
+                            self.mode = "ACTION"
+                            curr_win.collapsed = False
                     elif ch == 9:  # Tab
                         self.windows[self.active_win_idx].collapsed = not self.windows[
                             self.active_win_idx
@@ -1795,7 +1993,7 @@ class GPUQueueTUI:
                     win = self.windows[self.active_win_idx]
                     h = (self.stdscr.getmaxyx()[0] - 5) // 3  # approx height per window
 
-                    if ch == ord("h"):  # h
+                    if ch == ord("h") or ch == 27:  # h or Esc
                         self.mode = "NAV"
                         # Reset scroll to top
                         win.scroll_offset = 0
@@ -1821,15 +2019,8 @@ class GPUQueueTUI:
                     elif ch == ord("p"):  # Pause
                         if win.key == "running":
                             self.do_action("pause")
-                    elif ch == ord("+") or ch == ord("="):  # Prio Up
-                        if win.key == "pending":
-                            self.do_action("priority_up")
-                    elif ch == ord("-") or ch == ord("_"):  # Prio Down
-                        if win.key == "pending":
-                            self.do_action("priority_down")
-                    elif ch == ord("g"):  # Change GPUs
-                        if win.key == "pending":
-                            self.prompt_change_gpus()
+                    elif ch == ord("e"):  # Edit
+                        self.do_action("edit")
 
         finally:
             self.stop()
@@ -1848,18 +2039,62 @@ class GPUQueueTUI:
         self.action_msg = f"Added {job['id']}"
         self.msg_clear_time = time.time() + 2.0
 
+    def prompt_edit_command(self):
+        # Use external editor
+        # 1. Write current cmd to temp file
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".sh") as tf:
+            tf.write(self.edit_job["cmd"])
+            tf_path = tf.name
+
+        # 2. Open editor
+        curses.def_shell_mode()
+        self.stdscr.clear()
+        self.stdscr.refresh()
+        curses.endwin()
+
+        try:
+            editor = os.environ.get("EDITOR", "nano")
+            subprocess.run([editor, tf_path])
+
+            # 3. Read back
+            with open(tf_path, "r") as f:
+                new_cmd = f.read().strip()
+                self._update_edit_cmd(new_cmd)
+
+            os.unlink(tf_path)
+        except Exception:
+            pass
+
+        finally:
+            self.stdscr.refresh()
+            curses.doupdate()
+            curses.reset_shell_mode()
+            self.stdscr.keypad(True)
+            self.stdscr.nodelay(True)
+
+    def _update_edit_cmd(self, val):
+        if self.edit_job:
+            self.edit_job["cmd"] = val
+
     def prompt_new_job(self):
-        self.modal = {
-            "type": "INPUT",
-            "title": "New Job",
-            "text": "Enter command:",
-            "value": "",
-            "cursor_pos": 0,
-            "on_confirm": lambda val: self.add_job_internal(
-                val, 2, 1
-            ),  # Default 2 GPUs, Med Prio
-            "on_cancel": None,
+        # Instead of modal, start Edit Mode with defaults
+        self.edit_job = {
+            "id": "NEW",
+            "_type": "pending",
+            "cmd": "",
+            "gpus": 1,
+            "priority": 1,  # Low
+            "added": datetime.now().isoformat(),
         }
+        self.edit_is_new = True
+        self.edit_mode_active = True
+        self.edit_field_idx = 0
+
+        # Switch to PENDING window if not already there
+        for i, w in enumerate(self.windows):
+            if w.key == "pending":
+                self.active_win_idx = i
+                break
 
     def prompt_change_gpus(self):
         win = self.windows[self.active_win_idx]
@@ -1913,18 +2148,34 @@ class GPUQueueTUI:
             }
             return
 
+        elif action == "edit":
+            if win.key != "pending":
+                self.action_msg = "Can only edit pending jobs"
+                self.msg_clear_time = time.time() + 2.0
+                return
+
+            self.edit_job = copy.deepcopy(job)
+            self.edit_job["_type"] = "pending"
+            self.edit_is_new = False
+            self.edit_mode_active = True
+            self.edit_field_idx = 0
+            return
+
         elif action == "dup":
-            self.modal = {
-                "type": "INPUT",
-                "title": "Duplicate Job",
-                "text": "Edit command:",
-                "value": job.get("cmd", ""),
-                "cursor_pos": len(job.get("cmd", "")),
-                "on_confirm": lambda val: self.add_job_internal(
-                    val, job.get("gpus", 2), 1
-                ),
-                "on_cancel": None,
-            }
+            self.edit_job = copy.deepcopy(job)
+            self.edit_job["id"] = "EDITING"  # Temp ID
+            self.edit_job["_type"] = "pending"  # Force type to pending for rendering
+            self.edit_is_new = True
+            self.edit_mode_active = True
+            self.edit_field_idx = 0
+
+            # Switch to PENDING window if not already there, as new jobs go there
+            # Find index of "pending" window
+            for i, w in enumerate(self.windows):
+                if w.key == "pending":
+                    self.active_win_idx = i
+                    break
+
             return
 
         # Immediate actions
@@ -1935,13 +2186,33 @@ class GPUQueueTUI:
         msg = ""
         try:
             if action == "cancel":
-                # Calls subprocess to ensure consistent behavior
-                subprocess.Popen(
-                    ["gpu-queue", "cancel", jid],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                msg = f"Cancelling {jid}..."
+                # If it's a pending job, move to completed with status 'cancelled'
+                # If it's running, call the external tool
+                is_pending = False
+                with locked_queue() as q:
+                    for j in q["pending"]:
+                        if j["id"] == jid:
+                            is_pending = True
+                            break
+
+                if is_pending:
+                    with locked_queue() as q:
+                        for i, j in enumerate(q["pending"]):
+                            if j["id"] == jid:
+                                job = q["pending"].pop(i)
+                                job["status"] = "cancelled"
+                                job["ended"] = datetime.now().isoformat()
+                                q["completed"].insert(0, job)
+                                msg = f"Cancelled {jid}"
+                                break
+                else:
+                    # Running job
+                    subprocess.Popen(
+                        ["gpu-queue", "cancel", jid],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    msg = f"Cancelling {jid}..."
 
             elif action == "delete":
                 with locked_queue() as q:
@@ -1973,18 +2244,22 @@ class GPUQueueTUI:
                             msg = f"{dir_s} priority of {jid} to {job['priority']}"
                             break
 
-            elif action == "change_gpus":
-                new_val = kwargs.get("new_val")
-                if new_val and new_val.isdigit():
-                    val = int(new_val)
-                    with locked_queue() as q:
-                        for job in q["pending"]:
-                            if job["id"] == jid:
-                                job["gpus"] = val
-                                msg = f"Updated {jid} to {val} GPUs"
-                                break
-                else:
-                    msg = "Invalid GPU count"
+            elif action == "update_job":
+                cmd = kwargs.get("cmd")
+                gpus = kwargs.get("gpus")
+                prio = kwargs.get("priority")
+
+                with locked_queue() as q:
+                    for job in q["pending"]:
+                        if job["id"] == jid:
+                            if cmd:
+                                job["cmd"] = cmd
+                            if gpus:
+                                job["gpus"] = gpus
+                            if prio:
+                                job["priority"] = prio
+                            msg = f"Updated job {jid}"
+                            break
 
         except Exception as e:
             msg = f"Err: {str(e)}"
