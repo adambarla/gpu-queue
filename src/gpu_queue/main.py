@@ -320,6 +320,9 @@ def run_job(job: dict, gpu_indices: list[int]) -> int:
     exit_file = QUEUE_DIR / f"{job['id']}.exit"
     gpu_str = ",".join(map(str, gpu_indices))
 
+    # Normalize command: collapse any newlines/whitespace to single line
+    cmd = " ".join(job["cmd"].split())
+
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_str
     # Ensure ~/.local/bin is in PATH for uv
@@ -329,7 +332,7 @@ def run_job(job: dict, gpu_indices: list[int]) -> int:
 
     with open(log_file, "w") as f:
         f.write(f"=== Job {job['id']} ===\n")
-        f.write(f"Command: {job['cmd']}\n")
+        f.write(f"Command: {cmd}\n")
         f.write(f"GPUs: {gpu_str}\n")
         f.write(f"Started: {datetime.now().isoformat()}\n")
         f.write("=" * 40 + "\n\n")
@@ -337,7 +340,7 @@ def run_job(job: dict, gpu_indices: list[int]) -> int:
     # Wrap in shell to capture exit code. Quote paths to be safe.
     q_log = f"'{log_file}'"
     q_exit = f"'{exit_file}'"
-    wrapped_cmd = f"({job['cmd']}) >> {q_log} 2>&1; echo $? > {q_exit}"
+    wrapped_cmd = f"({cmd}) >> {q_log} 2>&1; echo $? > {q_exit}"
 
     proc = subprocess.Popen(
         wrapped_cmd,
@@ -1692,9 +1695,16 @@ class GPUQueueTUI:
             elif self.mode == "NAV":
                 help_str += "j/k:Select  l:Focus  n:New Job  Tab:Collapse"
             else:
-                help_str += (
-                    "h:Back  Space:Log  c:Cancel  r:Remove  d:Duplicate  p:Pause"
-                )
+                # Context-aware help based on active window
+                win = self.windows[self.active_win_idx]
+                if win.key == "pending":
+                    help_str += "h:Back  Space:Log  c:Cancel  e:Edit  d:Dup  n:New"
+                elif win.key == "running":
+                    help_str += "h:Back  Space:Log  c:Cancel  p:Pause  d:Dup"
+                elif win.key == "completed":
+                    help_str += "h:Back  Space:Log  r:Retry  x:Delete  d:Dup"
+                else:
+                    help_str += "h:Back  Space:Log  d:Dup  n:New"
 
             # Mode display on the right
             mode_label = self.mode
@@ -2040,20 +2050,26 @@ class GPUQueueTUI:
                     elif ch == ord("L"):
                         self.action_open_external_logs()
 
-                    # Actions
-                    elif ch == ord("c"):  # Cancel
-                        self.do_action("cancel")
-                    elif ch == ord("r"):  # Remove
-                        self.do_action("remove")
-                    elif ch == ord("d"):  # Dup
+                    # Actions (context-aware per window type)
+                    elif ch == ord("c"):  # Cancel (pending/running only)
+                        if win.key in ["pending", "running"]:
+                            self.do_action("cancel")
+                    elif ch == ord("x"):  # Remove/Delete (completed only)
+                        if win.key == "completed":
+                            self.do_action("remove")
+                    elif ch == ord("d"):  # Dup (all windows)
                         self.do_action("dup")
                     elif ch == ord("n"):  # New
                         self.prompt_new_job()
-                    elif ch == ord("p"):  # Pause
+                    elif ch == ord("p"):  # Pause (running only)
                         if win.key == "running":
                             self.do_action("pause")
-                    elif ch == ord("e"):  # Edit
-                        self.do_action("edit")
+                    elif ch == ord("e"):  # Edit (pending only)
+                        if win.key == "pending":
+                            self.do_action("edit")
+                    elif ch == ord("r"):  # Retry (completed only)
+                        if win.key == "completed":
+                            self.do_action("retry")
 
         finally:
             self.stop()
@@ -2092,9 +2108,9 @@ class GPUQueueTUI:
             editor = os.environ.get("EDITOR", "nano")
             subprocess.run([editor, tf_path])
 
-            # 3. Read back
+            # 3. Read back (collapse newlines/whitespace to single line)
             with open(tf_path, "r") as f:
-                new_cmd = f.read().strip()
+                new_cmd = " ".join(f.read().split())
                 self._update_edit_cmd(new_cmd)
 
             os.unlink(tf_path)
@@ -2165,6 +2181,10 @@ class GPUQueueTUI:
 
         # Actions that require modals
         if action == "cancel":
+            # Cancel only works for pending/running
+            if win.key not in ["pending", "running"]:
+                return
+
             self.modal = {
                 "type": "CONFIRM",
                 "title": "Cancel Job",
@@ -2175,14 +2195,10 @@ class GPUQueueTUI:
             return
 
         elif action == "remove":
-            if win.key != "completed":
-                self.action_msg = "Can only remove finished jobs"
-                self.msg_clear_time = time.time() + 2.0
-                return
-
+            # Remove only works for completed (already checked in keybinding)
             self.modal = {
                 "type": "CONFIRM",
-                "title": "Remove Job",
+                "title": "Delete Job",
                 "text": f"Permanently delete {jid}?",
                 "on_confirm": lambda: self.execute_action("delete", jid),
                 "on_cancel": None,
@@ -2190,11 +2206,7 @@ class GPUQueueTUI:
             return
 
         elif action == "edit":
-            if win.key != "pending":
-                self.action_msg = "Can only edit pending jobs"
-                self.msg_clear_time = time.time() + 2.0
-                return
-
+            # Edit only works for pending (already checked in keybinding)
             self.edit_job = copy.deepcopy(job)
             self.edit_job["_type"] = "pending"
             self.edit_is_new = False
@@ -2283,6 +2295,23 @@ class GPUQueueTUI:
                                 job["priority"] = max(0, p - 1)
                                 dir_s = "Decreased"
                             msg = f"{dir_s} priority of {jid} to {job['priority']}"
+                            break
+
+            elif action == "retry":
+                with locked_queue() as q:
+                    for i, j in enumerate(q["completed"]):
+                        if j["id"] == jid:
+                            job = q["completed"].pop(i)
+                            # Reset job for re-queue
+                            new_job = {
+                                "id": job["id"],  # Keep same ID
+                                "cmd": job["cmd"],
+                                "gpus": job.get("gpus", 1),
+                                "added": datetime.now().isoformat(),
+                                "priority": 1,  # Medium priority
+                            }
+                            q["pending"].append(new_job)
+                            msg = f"Re-queued {jid}"
                             break
 
             elif action == "update_job":
