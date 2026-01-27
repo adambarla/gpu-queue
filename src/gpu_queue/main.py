@@ -31,11 +31,11 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional, cast
 
 # Try importing requests. Env should have it. Fallback if needed.
 try:
-    import requests
+    import requests  # type: ignore
 except ImportError:
     requests = None
 
@@ -815,7 +815,9 @@ class GPUQueueTUI:
         self.last_updated = 0
         self.action_msg = ""
         self.msg_clear_time = 0
-        self.modal = None  # { type, title, text, val... }
+        self.action_msg = ""
+        self.msg_clear_time = 0
+        self.modal: Optional[Dict[str, Any]] = None  # { type, title, text, val... }
 
         # Windows
         self.windows = [
@@ -914,6 +916,8 @@ class GPUQueueTUI:
             time.sleep(self.interval)
 
     def draw_box(self, y, x, h, w, title, active=False, focused=False):
+        if self.stdscr is None:
+            return
         """Draw a bordered box."""
         try:
             color = curses.color_pair(4)  # Cyan default
@@ -1029,9 +1033,9 @@ class GPUQueueTUI:
             # User said "definitely not blinking and don't know what field".
             # So let's use brackets OR arrows if length permits.
             # Changing length breaks column alignment unless we account for it.
-            # Simple approach: Return exact same string length but rely heavily on REVERSE.
+            # Simple approach: Exact length, rely on REVERSE.
 
-            # Wait, if we use segments, we can just rely on REVERSE.
+            # Highlighting via REVERSE
             # If REVERSE isn't showing, maybe the terminal is weird.
             # Let's try adding explicit indicators.
 
@@ -1113,6 +1117,8 @@ class GPUQueueTUI:
         return full_line, color
 
     def draw(self):
+        if self.stdscr is None:
+            return
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
 
@@ -1247,6 +1253,10 @@ class GPUQueueTUI:
         self.stdscr.refresh()
 
     def draw_modal(self, h, w):
+        if self.stdscr is None:
+            return
+        if self.modal is None:
+            return
         """Draw a modal overlay."""
         m_h, m_w = 16, 80
         y = (h - m_h) // 2
@@ -1373,6 +1383,8 @@ class GPUQueueTUI:
             pass
 
     def draw_compact_gpu_info(self, y, x, h, w):
+        if self.stdscr is None:
+            return
         """Draw compact nvidia-smi style info."""
         try:
             if not self.gpu_status:
@@ -1424,6 +1436,8 @@ class GPUQueueTUI:
             pass
 
     def draw_job_details(self, y, x, h, w):
+        if self.stdscr is None:
+            return
         """Draw detailed job information for the selected job across all windows."""
         try:
             # In NAV mode, show placeholder
@@ -1460,7 +1474,7 @@ class GPUQueueTUI:
             cmd = cmd.replace("\n", " ").replace("\r", " ")
 
             prefix = "Cmd: "
-            # Safer width calc: W - Left(2) - Right(2) - ScrollBar(1) - Prefix - Safety(2)
+            # Width calculation checks
             # w - 5 - len(prefix) ?
             # w is Full Width.
             # Draws at x+2.
@@ -1488,6 +1502,8 @@ class GPUQueueTUI:
             pass
 
     def draw_window(self, win, y, x, h, w, active, focused):
+        if self.stdscr is None:
+            return
         # Draw Box
         try:
             # Border Color logic
@@ -1662,6 +1678,8 @@ class GPUQueueTUI:
             pass
 
     def draw_footer(self, y, w):
+        if self.stdscr is None:
+            return
         try:
             if self.modal:
                 return  # Don't draw footer over modal or distract
@@ -1693,6 +1711,8 @@ class GPUQueueTUI:
             pass
 
     def draw_log_overlay(self, h, w):
+        if self.stdscr is None:
+            return
         # Draw a floating window for logs
         margin_x = 4
         margin_y = 2
@@ -1770,10 +1790,11 @@ class GPUQueueTUI:
             return
 
         # We need to temporarily exit curses
-        curses.def_shell_mode()
-        self.stdscr.clear()
-        self.stdscr.refresh()
-        curses.endwin()
+        if self.stdscr:
+            curses.def_shell_mode()
+            self.stdscr.clear()
+            self.stdscr.refresh()
+            curses.endwin()
 
         try:
             # Use +F for following if it's currently running, otherwise just open it
@@ -1790,12 +1811,13 @@ class GPUQueueTUI:
                 signal.signal(signal.SIGINT, old_handler)
         finally:
             # Re-enter curses
-            self.stdscr.refresh()
-            curses.doupdate()
-            # Some implementations need reset_shell_mode
-            curses.reset_shell_mode()
-            self.stdscr.keypad(True)
-            self.stdscr.nodelay(True)
+            if self.stdscr:
+                self.stdscr.refresh()
+                curses.doupdate()
+                # Some implementations need reset_shell_mode
+                curses.reset_shell_mode()
+                self.stdscr.keypad(True)
+                self.stdscr.nodelay(True)
 
     def main(self, stdscr):
         import curses
@@ -1878,17 +1900,22 @@ class GPUQueueTUI:
                         elif ch == curses.KEY_UP:
                             # Move up one line (width 74 = 80 - 6)
                             width = 80 - 6
-                            m["cursor_pos"] = max(0, cpos - width)
+                            cpos_int = cast(int, cpos)
+                            m["cursor_pos"] = max(0, cpos_int - width)
                         elif ch == curses.KEY_DOWN:
                             width = 80 - 6
-                            m["cursor_pos"] = min(len(val), cpos + width)
+                            cpos_int = cast(int, cpos)
+                            m["cursor_pos"] = min(len(str(val)), cpos_int + width)
                         elif ch == curses.KEY_HOME:
                             m["cursor_pos"] = 0
                         elif ch == curses.KEY_END:
                             m["cursor_pos"] = len(val)
                         elif ch >= 32 and ch <= 126:  # Printable
-                            m["value"] = val[:cpos] + chr(ch) + val[cpos:]
-                            m["cursor_pos"] = cpos + 1
+                            cpos_int = cast(int, cpos)
+                            m["value"] = (
+                                str(val)[:cpos_int] + chr(ch) + str(val)[cpos_int:]
+                            )
+                            m["cursor_pos"] = cpos_int + 1
                     continue
 
                 if self.edit_mode_active:
@@ -1899,6 +1926,8 @@ class GPUQueueTUI:
                         self.edit_mode_active = False
                         self.edit_job = None
                     elif ch == ord("e"):  # Confirm
+                        if self.edit_job is None:
+                            continue
                         if self.edit_is_new:
                             self.add_job_internal(
                                 self.edit_job["cmd"],
@@ -1923,6 +1952,8 @@ class GPUQueueTUI:
                         self.edit_field_idx = min(2, self.edit_field_idx + 1)
 
                     elif ch == ord("j"):  # Decrease Value
+                        if self.edit_job is None:
+                            continue
                         if self.edit_field_idx == 0:  # GPUS
                             self.edit_job["gpus"] = max(
                                 1, int(self.edit_job["gpus"]) - 1
@@ -1933,6 +1964,8 @@ class GPUQueueTUI:
                             )
 
                     elif ch == ord("k"):  # Increase Value
+                        if self.edit_job is None:
+                            continue
                         if self.edit_field_idx == 0:  # GPUS
                             self.edit_job["gpus"] = int(self.edit_job["gpus"]) + 1
                             # Assuming no hard max, or maybe max_gpus from status?
@@ -2040,17 +2073,20 @@ class GPUQueueTUI:
         self.msg_clear_time = time.time() + 2.0
 
     def prompt_edit_command(self):
+        if self.edit_job is None:
+            return
+
         # Use external editor
         # 1. Write current cmd to temp file
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".sh") as tf:
-            tf.write(self.edit_job["cmd"])
+            tf.write(str(self.edit_job["cmd"]))
             tf_path = tf.name
 
-        # 2. Open editor
-        curses.def_shell_mode()
-        self.stdscr.clear()
-        self.stdscr.refresh()
-        curses.endwin()
+        if self.stdscr:
+            curses.def_shell_mode()
+            self.stdscr.clear()
+            self.stdscr.refresh()
+            curses.endwin()
 
         try:
             editor = os.environ.get("EDITOR", "nano")
@@ -2066,17 +2102,22 @@ class GPUQueueTUI:
             pass
 
         finally:
-            self.stdscr.refresh()
-            curses.doupdate()
-            curses.reset_shell_mode()
-            self.stdscr.keypad(True)
-            self.stdscr.nodelay(True)
+            if self.stdscr:
+                self.stdscr.refresh()
+                curses.doupdate()
+                curses.reset_shell_mode()
+                self.stdscr.keypad(True)
+                self.stdscr.nodelay(True)
 
     def _update_edit_cmd(self, val):
+        if self.edit_job is None:
+            return
         if self.edit_job:
             self.edit_job["cmd"] = val
 
     def prompt_new_job(self):
+        if self.stdscr is None:
+            return
         # Instead of modal, start Edit Mode with defaults
         self.edit_job = {
             "id": "NEW",
