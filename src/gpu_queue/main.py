@@ -84,9 +84,12 @@ def load_queue_raw() -> dict[str, list]:
         return {"pending": [], "running": [], "completed": []}
 
     try:
+        if not QUEUE_FILE.exists() or QUEUE_FILE.stat().st_size == 0:
+            return {"pending": [], "running": [], "completed": []}
         with open(QUEUE_FILE) as f:
             return json.load(f)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as e:
+        log_msg(f"Error loading queue JSON: {e}")
         return {"pending": [], "running": [], "completed": []}
 
 
@@ -306,11 +309,8 @@ def cleanup_dead_jobs():
 
         if changed:
             queue["running"] = still_running
-            # save_queue_raw is called by locked_queue context manager
         else:
-            still_running.append(job)  # ensure we don't lose them if not changed
-            # But actually still_running is what we want.
-            # If not changed, queue["running"] remains same.
+            # No changes needed, queue remains unchanged.
             pass
 
 
@@ -845,6 +845,70 @@ class GPUQueueTUI:
         self.edit_field_idx = 0  # 0: GPUs, 1: Priority, 2: Command
         self.edit_is_new = False
 
+        # Dynamic column widths for tables
+        self.col_widths = {
+            "running": {"id": 8, "pid": 6, "gpus": 4, "elapsed": 7},
+            "pending": {"id": 8, "gpus": 4, "prio": 4, "waiting": 7},
+            "completed": {"id": 8, "runtime": 7, "ago": 7},
+        }
+
+    def _calc_col_widths(self):
+        """Calculate column widths based on current data for all tables."""
+        try:
+            # Running table
+            running_w = {"id": 3, "pid": 3, "gpus": 4, "elapsed": 7}
+            for job in self.data.get("running", []):
+                jid = job.get("id", "")[:8]
+                running_w["id"] = max(running_w["id"], len(jid))
+                running_w["pid"] = max(running_w["pid"], len(str(job.get("pid", ""))))
+                gpus = ",".join(map(str, job.get("assigned_gpus", [])))
+                running_w["gpus"] = max(running_w["gpus"], len(gpus) if gpus else 1)
+                start_dt = self._parse_iso(job.get("started"))
+                if start_dt:
+                    elapsed = self._fmt_delta(datetime.now() - start_dt)
+                    running_w["elapsed"] = max(running_w["elapsed"], len(elapsed))
+
+            # Pending table
+            pending_w = {"id": 3, "gpus": 4, "prio": 4, "waiting": 7}
+            for job in self.data.get("pending", []):
+                jid = job.get("id", "")[:8]
+                pending_w["id"] = max(pending_w["id"], len(jid))
+                pending_w["gpus"] = max(pending_w["gpus"], len(str(job.get("gpus", 1))))
+                add_dt = self._parse_iso(job.get("added"))
+                if add_dt:
+                    waiting = self._fmt_delta(datetime.now() - add_dt)
+                    pending_w["waiting"] = max(pending_w["waiting"], len(waiting))
+
+            # Completed table
+            completed_w = {"id": 3, "runtime": 7, "ago": 7}
+            for job in self.data.get("completed", []):
+                jid = job.get("id", "")[:8]
+                completed_w["id"] = max(completed_w["id"], len(jid))
+                start_dt = self._parse_iso(job.get("started"))
+                end_dt = self._parse_iso(job.get("ended"))
+                if start_dt and end_dt:
+                    run_s = self._fmt_delta(end_dt - start_dt)
+                    completed_w["runtime"] = max(completed_w["runtime"], len(run_s))
+                if end_dt:
+                    ago_s = self._fmt_delta(datetime.now() - end_dt)
+                    completed_w["ago"] = max(completed_w["ago"], len(ago_s))
+
+            # Add padding
+            for key in running_w:
+                running_w[key] += 1
+            for key in pending_w:
+                pending_w[key] += 1
+            for key in completed_w:
+                completed_w[key] += 1
+
+            self.col_widths = {
+                "running": running_w,
+                "pending": pending_w,
+                "completed": completed_w,
+            }
+        except Exception:
+            pass  # Keep existing widths on error
+
     def start(self):
         self.running = True
         # Fast loop for queue updates
@@ -881,6 +945,9 @@ class GPUQueueTUI:
                         for item in items:
                             item["_type"] = type_label
                         w.update_items(items)
+
+                    # Calculate dynamic column widths
+                    self._calc_col_widths()
 
                 time.sleep(0.5)  # Fast update
             except Exception:
@@ -997,7 +1064,7 @@ class GPUQueueTUI:
         prefix = ""
 
         if job["_type"] == "running":
-            # Formt: ID(8) | PID(6) | GPUS(8) | ELAPSED(9) | CMD
+            # Formt: ID(8) | PID(10) | GPUS(8) | ELAPSED(9) | CMD
             color = curses.color_pair(5)  # Blue
 
             gpus = ",".join(map(str, job.get("assigned_gpus", [])))
@@ -1011,7 +1078,12 @@ class GPUQueueTUI:
             if start_dt:
                 elapsed = self._fmt_delta(datetime.now() - start_dt)
 
-            prefix = f" {jid:<8} {pid:<6} {gpus:<8} {elapsed:<9} "
+            # Use dynamic column widths
+            cw = self.col_widths["running"]
+            prefix = (
+                f" {jid:<{cw['id']}} {pid:<{cw['pid']}} "
+                f"{gpus:<{cw['gpus']}} {elapsed:<{cw['elapsed']}} "
+            )
 
         elif job["_type"] == "pending":
             # Format: ID(8) | PRIO(6) | WAITING(9) | CMD
@@ -1042,7 +1114,12 @@ class GPUQueueTUI:
             # If REVERSE isn't showing, maybe the terminal is weird.
             # Let's try adding explicit indicators.
 
-            prefix = f" {jid:<8} {gpus:<6} {p_s:<8} {waiting:<9} "
+            # Use dynamic column widths
+            cw = self.col_widths["pending"]
+            prefix = (
+                f" {jid:<{cw['id']}} {gpus:<{cw['gpus']}} "
+                f"{p_s:<{cw['prio']}} {waiting:<{cw['waiting']}} "
+            )
 
         else:
             # Completed/Finished
@@ -1069,7 +1146,11 @@ class GPUQueueTUI:
             if end_dt:
                 ago_s = self._fmt_delta(datetime.now() - end_dt)
 
-            prefix = f" {jid:<8} {run_s:<9} {ago_s:<9} "
+            # Use dynamic column widths
+            cw = self.col_widths["completed"]
+            prefix = (
+                f" {jid:<{cw['id']}} {run_s:<{cw['runtime']}} {ago_s:<{cw['ago']}} "
+            )
 
         cmd = job.get("cmd", "")
         avail_cmd = w - len(prefix)
@@ -1079,39 +1160,32 @@ class GPUQueueTUI:
         full_line = prefix + cmd
 
         if is_editing and job["_type"] == "pending":
-            # Use Brackets for visibility even if colors fail
-            # We need to construct segments with markers
+            # Use dynamic column widths for edit mode too
+            cw = self.col_widths["pending"]
 
-            # Field 0: GPUS. Width 6.
-            s_gpus = f"{gpus:<6} "
+            # Field 0: GPUS
             if edit_idx == 0:
-                s_gpus = f"[{gpus}]".ljust(7)  # Makes it slightly wider? No good.
-                # Keep width 7 (6+1 space)
-                # {gpus} is e.g. "1" (len 1). "1     "
-                # "[1]   "
                 s_val = f"[{gpus}]"
-                s_gpus = f"{s_val:<7}"
+                s_gpus = f"{s_val:<{cw['gpus'] + 1}}"
             else:
-                s_gpus = f"{gpus:<6} "
+                s_gpus = f"{gpus:<{cw['gpus']}} "
 
-            # Field 1: PRIO. Width 8.
-            # {p_s} e.g. "L"
+            # Field 1: PRIO
             if edit_idx == 1:
                 s_val = f"[{p_s}]"
-                s_prio = f"{s_val:<9}"
+                s_prio = f"{s_val:<{cw['prio'] + 1}}"
             else:
-                s_prio = f"{p_s:<8} "
+                s_prio = f"{p_s:<{cw['prio']}} "
 
-            # Field 2: CMD.
-            # Just highlight it.
+            # Field 2: CMD - just highlight it
 
             return {
                 "type": "rich",
                 "segments": [
-                    (f" {jid:<8} ", curses.A_NORMAL),
+                    (f" {jid:<{cw['id']}} ", curses.A_NORMAL),
                     (s_gpus, curses.A_REVERSE if edit_idx == 0 else curses.A_NORMAL),
                     (s_prio, curses.A_REVERSE if edit_idx == 1 else curses.A_NORMAL),
-                    (f"{waiting:<9} ", curses.A_NORMAL),
+                    (f"{waiting:<{cw['waiting']}} ", curses.A_NORMAL),
                     (cmd, curses.A_REVERSE if edit_idx == 2 else curses.A_NORMAL),
                 ],
                 "base_color": color | curses.A_BLINK,
@@ -1194,7 +1268,7 @@ class GPUQueueTUI:
             if not self.windows[0].collapsed:
                 running_items = len(self.data.get("running", []))
                 running_content_len = running_items + 1  # +1 for header
-                running_h = min(running_content_len + 3, avail_h // 3)
+                running_h = min(running_content_len + 2, avail_h // 3)  # +2 for border
                 running_h = max(3, running_h)
             else:
                 running_h = 1
@@ -1559,11 +1633,26 @@ class GPUQueueTUI:
             header_offset = 1
             hdr = ""
             if win.key == "running":
-                hdr = " ID       PID   GPUS    ELAPSED  CMD"
+                # Dynamic header based on column widths
+                cw = self.col_widths["running"]
+                hdr = (
+                    f" {'ID':<{cw['id']}} {'PID':<{cw['pid']}} "
+                    f"{'GPUS':<{cw['gpus']}} {'ELAPSED':<{cw['elapsed']}} CMD"
+                )
             elif win.key == "pending":
-                hdr = " ID       GPUS   PRIO     WAITING   CMD"
+                # Dynamic header based on column widths
+                cw = self.col_widths["pending"]
+                hdr = (
+                    f" {'ID':<{cw['id']}} {'GPUS':<{cw['gpus']}} "
+                    f"{'PRIO':<{cw['prio']}} {'WAITING':<{cw['waiting']}} CMD"
+                )
             elif win.key == "completed":
-                hdr = " ID       RUNTIME   AGO       CMD"
+                # Dynamic header based on column widths
+                cw = self.col_widths["completed"]
+                hdr = (
+                    f" {'ID':<{cw['id']}} {'RUNTIME':<{cw['runtime']}} "
+                    f"{'AGO':<{cw['ago']}} CMD"
+                )
 
             if hdr:
                 self.stdscr.addstr(y + 1, 1, hdr, curses.A_DIM | curses.A_UNDERLINE)
@@ -1970,7 +2059,7 @@ class GPUQueueTUI:
                             )
                         elif self.edit_field_idx == 1:  # Prio
                             self.edit_job["priority"] = max(
-                                1, int(self.edit_job["priority"]) - 1
+                                0, int(self.edit_job["priority"]) - 1
                             )
 
                     elif ch == ord("k"):  # Increase Value
@@ -2326,7 +2415,7 @@ class GPUQueueTUI:
                                 job["cmd"] = cmd
                             if gpus:
                                 job["gpus"] = gpus
-                            if prio:
+                            if prio is not None:
                                 job["priority"] = prio
                             msg = f"Updated job {jid}"
                             break
