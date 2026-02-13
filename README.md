@@ -2,6 +2,10 @@
 
 A lightweight job queue for shared GPU servers without SLURM.
 
+## Demo
+
+<video src="demo.mov" controls title="Demo"></video>
+
 ## Installation
 
 1.  **Clone the repository**:
