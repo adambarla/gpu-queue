@@ -50,6 +50,15 @@ POLL_INTERVAL = 2  # seconds between GPU checks
 MIN_FREE_GPUS = 2  # Number of GPUs to always keep free for other users
 SERVER_PORT = 12345
 
+# Sparkline for GPU util (U+2581..U+2588). Buffer ≥ max spark columns so full width scrolls.
+_BLOCK_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+GPU_UTIL_HISTORY_MAX_SAMPLES = 512
+# GPU STATUS table: fixed widths so header and rows align (content inside borders)
+GPU_COL_IDX_W = 4
+GPU_COL_UTIL_W = 4  # "100%"
+GPU_COL_MEM_W = 14
+GPU_MIN_PROC_W = 8
+
 
 def get_server_url():
     return f"http://localhost:{SERVER_PORT}"
@@ -572,6 +581,72 @@ def get_terminal_width() -> int:
     return shutil.get_terminal_size((80, 20)).columns
 
 
+def sparkline_trailing(util_series: list[int], width: int) -> str:
+    """Latest `width` samples as block chars, right-aligned (scrolls as time passes)."""
+    if width <= 0:
+        return ""
+    if not util_series:
+        return " " * width
+    tail = util_series[-width:]
+    parts: list[str] = []
+    for u in tail:
+        u = max(0, min(100, int(u)))
+        bi = min(7, u * 7 // 100)
+        parts.append(_BLOCK_SPARK_CHARS[bi])
+    s = "".join(parts)
+    return (" " * (width - len(s))) + s
+
+
+def _gpu_status_column_widths(inner: int) -> tuple[int, int, int]:
+    """Return (prefix_w, hist_w, proc_w). Row is prefix + ' ' + [hist + ' '] + proc (full inner)."""
+    prefix_w = GPU_COL_IDX_W + 1 + GPU_COL_UTIL_W + 1 + GPU_COL_MEM_W
+    slack = inner - prefix_w
+    if slack <= 0:
+        return prefix_w, 0, 0
+    if slack == 1:
+        return prefix_w, 0, 1
+    pair = slack - 2
+    if pair < GPU_MIN_PROC_W:
+        return prefix_w, 0, slack - 1
+    proc_w = max(GPU_MIN_PROC_W, pair // 3)
+    hist_w = pair - proc_w
+    return prefix_w, hist_w, proc_w
+
+
+def _fit_text_field(s: str, max_w: int) -> str:
+    if max_w <= 0:
+        return ""
+    if len(s) <= max_w:
+        return s.ljust(max_w)
+    if max_w <= 3:
+        return s[:max_w]
+    return s[: max_w - 3] + "..."
+
+
+def _format_gpu_history_span_seconds(total_sec: int) -> str:
+    total_sec = max(0, int(total_sec))
+    if total_sec < 60:
+        return f"{total_sec}s"
+    if total_sec < 3600:
+        m, s = divmod(total_sec, 60)
+        return f"{m}m" if s == 0 else f"{m}m{s}s"
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
+    if m == 0 and s == 0:
+        return f"{h}h"
+    if s == 0:
+        return f"{h}h{m}m"
+    return f"{h}h{m}m{s}s"
+
+
+def _gpu_history_header_label(hist_w: int, sample_interval_sec: float) -> str:
+    """Visible window = one sample per column at daemon poll cadence."""
+    if hist_w <= 0:
+        return ""
+    span_sec = int(round(hist_w * sample_interval_sec))
+    return f"HISTORY {_format_gpu_history_span_seconds(span_sec)}"
+
+
 def shorten_command(cmd: str, max_len: int) -> str:
     """Shorten a command string to max_len by removing the middle part."""
     if len(cmd) <= max_len:
@@ -821,6 +896,8 @@ class GPUQueueTUI:
         self.action_msg = ""
         self.msg_clear_time = 0
         self.modal: Optional[Dict[str, Any]] = None  # { type, title, text, val... }
+        self._gpu_util_history: dict[int, list[int]] = {}
+        self._last_util_status_ts: Optional[str] = None
 
         # Windows
         self.windows = [
@@ -954,6 +1031,21 @@ class GPUQueueTUI:
                 # with self.lock: self.action_msg = f"Q Poll Error: {str(e)}"
                 time.sleep(1)
 
+    def _append_gpu_util_sample(self, status: dict[str, Any]) -> None:
+        ts = status.get("ts")
+        if not ts or ts == self._last_util_status_ts:
+            return
+        self._last_util_status_ts = ts
+        for g in status.get("gpus", []):
+            idx = g.get("index")
+            if idx is None:
+                continue
+            util = int(g.get("util", 0))
+            buf = self._gpu_util_history.setdefault(int(idx), [])
+            buf.append(max(0, min(100, util)))
+            while len(buf) > GPU_UTIL_HISTORY_MAX_SAMPLES:
+                buf.pop(0)
+
     def _poll_gpu_loop(self):
         """Poll GPU status at slower interval."""
         while self.running:
@@ -971,6 +1063,7 @@ class GPUQueueTUI:
                                 self.min_free = s.get("min_free", 2)
                                 self.excluded = s.get("excluded", [])
                                 self.server_status = "DAEMON: ON"
+                                self._append_gpu_util_sample(s)
                         else:
                             with self.lock:
                                 self.server_status = "DAEMON: S?"
@@ -1464,51 +1557,83 @@ class GPUQueueTUI:
             return
         """Draw compact nvidia-smi style info."""
         try:
+            left = x + 2
+            inner = max(0, w - 4)
+            prefix_w, hist_w, proc_w = _gpu_status_column_widths(inner)
+            hdr_attr = curses.A_DIM | curses.A_UNDERLINE
+            row_attr = curses.A_DIM
+
             if not self.gpu_status:
-                self.stdscr.addstr(y + 1, x + 2, "No GPU info available", curses.A_DIM)
+                self.stdscr.addstr(y + 1, left, "No GPU info available", curses.A_DIM)
                 return
 
-            # Column headers
-            # Column headers
-            # IDX:0, UTIL:5, MEM:10, PROCS:26
-            header = "IDX  UTIL MEM            PROCESSES (USER:PID)"
-            if w > 30:
-                self.stdscr.addstr(
-                    y, x + 2, header[: w - 4], curses.A_DIM | curses.A_UNDERLINE
-                )
+            hdr_idx = "IDX".ljust(GPU_COL_IDX_W)[:GPU_COL_IDX_W]
+            hdr_util = "UTIL".ljust(GPU_COL_UTIL_W)[:GPU_COL_UTIL_W]
+            hdr_mem = "MEM".ljust(GPU_COL_MEM_W)[:GPU_COL_MEM_W]
+            prefix_hdr = f"{hdr_idx} {hdr_util} {hdr_mem}"
+            if len(prefix_hdr) > inner:
+                self.stdscr.addstr(y, left, prefix_hdr[:inner], hdr_attr)
+            else:
+                self.stdscr.addstr(y, left, prefix_hdr, hdr_attr)
+                col = left + prefix_w + 1
+                if hist_w > 0:
+                    h_hist = _fit_text_field(
+                        _gpu_history_header_label(hist_w, POLL_INTERVAL),
+                        hist_w,
+                    ).ljust(hist_w)[:hist_w]
+                    self.stdscr.addstr(y, col, h_hist, hdr_attr)
+                    col += hist_w + 1
+                h_proc = _fit_text_field("PROCESSES (USER:PID)", proc_w).ljust(proc_w)[
+                    :proc_w
+                ]
+                if proc_w > 0:
+                    self.stdscr.addstr(y, col, h_proc, hdr_attr)
 
             for i, g in enumerate(self.gpu_status[: h - 1]):
                 idx = g.get("index", "?")
                 used_mb = g.get("used_mb", 0)
                 total_mb = g.get("total_mb", 0)
                 util = g.get("util", 0)
-                # busy = not g.get("free", True) # Unused now
-
-                # Status text gray regardless of state
-                color = curses.A_DIM  # Lighter Gray
 
                 used_gb = used_mb / 1024.0
                 total_gb = total_mb / 1024.0
                 mem_s = f"{used_gb:.1f}/{total_gb:.0f}G"
 
                 line_y = y + 1 + i
-                self.stdscr.addstr(
-                    line_y, x + 2, f"{idx:<4} {util:>3}% {mem_s:<15}", color
-                )
+                idx_s = (
+                    str(int(idx))[:GPU_COL_IDX_W]
+                    if isinstance(idx, int)
+                    else str(idx)[:GPU_COL_IDX_W]
+                ).ljust(GPU_COL_IDX_W)[:GPU_COL_IDX_W]
+                u = max(0, min(100, int(util)))
+                util_s = f"{u:>3}%".ljust(GPU_COL_UTIL_W)[:GPU_COL_UTIL_W]
+                mem_col = mem_s[:GPU_COL_MEM_W].ljust(GPU_COL_MEM_W)[:GPU_COL_MEM_W]
+                prefix_row = f"{idx_s} {util_s} {mem_col}"
+                if len(prefix_row) > inner:
+                    self.stdscr.addstr(line_y, left, prefix_row[:inner], row_attr)
+                    continue
 
-                procs = g.get("processes", [])
+                self.stdscr.addstr(line_y, left, prefix_row, row_attr)
+                col = left + prefix_w + 1
+                if hist_w > 0:
+                    hist = (
+                        self._gpu_util_history.get(int(idx), [])
+                        if idx != "?"
+                        else []
+                    )
+                    spark = sparkline_trailing(hist, hist_w)
+                    self.stdscr.addstr(line_y, col, spark, row_attr)
+                    col += hist_w + 1
                 proc_strs = [
                     f"{p.get('user', '?')}:{p.get('pid', '?')}"
-                    for p in procs
+                    for p in g.get("processes", [])
                     if not p.get("zombie")
                 ]
-                proc_line = ", ".join(proc_strs)
-
-                avail_proc_w = w - 28
-                if len(proc_line) > avail_proc_w:
-                    proc_line = proc_line[: avail_proc_w - 3] + "..."
-
-                self.stdscr.addstr(line_y, x + 28, proc_line, curses.A_DIM)
+                proc_line = _fit_text_field(", ".join(proc_strs), proc_w).ljust(proc_w)[
+                    :proc_w
+                ]
+                if proc_w > 0:
+                    self.stdscr.addstr(line_y, col, proc_line, curses.A_DIM)
         except Exception:
             pass
 
