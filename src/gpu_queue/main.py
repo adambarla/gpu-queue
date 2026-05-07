@@ -75,6 +75,20 @@ def ensure_dirs():
 LOCK_FILE = QUEUE_DIR / "queue.lock"
 
 
+def _empty_queue() -> dict[str, list]:
+    return {"staging": [], "pending": [], "running": [], "completed": []}
+
+
+def _normalize_queue(raw: Any) -> dict[str, list]:
+    queue = _empty_queue()
+    if not isinstance(raw, dict):
+        return queue
+    for key in queue:
+        val = raw.get(key, [])
+        queue[key] = val if isinstance(val, list) else []
+    return queue
+
+
 @contextmanager
 def locked_queue():
     """Context manager for thread-safe and process-safe queue access."""
@@ -92,28 +106,21 @@ def locked_queue():
 def load_queue_raw() -> dict[str, list]:
     """Load the job queue from disk without locking."""
     if not QUEUE_FILE.exists():
-        return {"pending": [], "running": [], "completed": []}
+        return _empty_queue()
 
     try:
         if not QUEUE_FILE.exists() or QUEUE_FILE.stat().st_size == 0:
-            return {"pending": [], "running": [], "completed": []}
+            return _empty_queue()
         with open(QUEUE_FILE) as f:
-            return json.load(f)
+            return _normalize_queue(json.load(f))
     except (json.JSONDecodeError, ValueError) as e:
         log_msg(f"Error loading queue JSON: {e}")
-        return {"pending": [], "running": [], "completed": []}
-
-
-def sort_pending_queue(queue: dict[str, list]):
-    """Sort pending queue by priority (higher first), then added time (older first)."""
-    # Priority mapping: 0=low, 1=medium, 2=high
-    queue["pending"].sort(key=lambda x: (-x.get("priority", 1), x["added"]))
+        return _empty_queue()
 
 
 def save_queue_raw(queue: dict[str, list]):
     """Save the job queue to disk without locking (atomic replace)."""
     ensure_dirs()
-    sort_pending_queue(queue)
     temp_file = QUEUE_FILE.with_suffix(".tmp")
     with open(temp_file, "w") as f:
         json.dump(queue, f, indent=2)
@@ -518,7 +525,10 @@ def cmd_add(args):
     }
 
     with locked_queue() as queue:
-        queue["pending"].append(job)
+        if args.front:
+            queue["pending"].insert(0, job)
+        else:
+            queue["pending"].append(job)
 
     print(f"✓ Added job {job['id']} (requires {args.gpus} GPUs)")
     print(f"  Command: {args.command}")
@@ -864,7 +874,7 @@ class Window:
         visible_h = max(1, effective_h - 2)
 
         # Account for header in list windows
-        if self.key in ["running", "pending", "completed"]:
+        if self.key in ["running", "staging", "pending", "completed"]:
             visible_h = max(1, visible_h - 1)
 
         if self.selected_idx < self.scroll_offset:
@@ -886,8 +896,8 @@ class GPUQueueTUI:
         self.lock = threading.Lock()
 
         # State
-        self.data = {"running": [], "pending": [], "completed": []}
-        self.data = {"running": [], "pending": [], "completed": []}
+        self.data = {"staging": [], "running": [], "pending": [], "completed": []}
+        self.data = {"staging": [], "running": [], "pending": [], "completed": []}
         self.gpu_status = []
         self.min_free = 2
         self.excluded = []
@@ -905,6 +915,7 @@ class GPUQueueTUI:
         self.windows = [
             Window("RUNNING", "running", 0.2),
             Window("PENDING", "pending", 0.2),
+            Window("STAGING", "staging", 0.2),
             Window("COMPLETED", "completed", 0.2),
             Window("GPU STATUS", "gpu_status", 0.2),
             Window("SELECTED JOB", "job_details", 0.2),
@@ -921,21 +932,34 @@ class GPUQueueTUI:
         # Edit Mode State
         self.edit_mode_active = False
         self.edit_job = None
-        self.edit_field_idx = 0  # 0: GPUs, 1: Priority, 2: Command
+        self.edit_field_idx = 0  # 0: GPUs, 1: Command
         self.edit_is_new = False
-        # Row index in pending list where draft new/duplicate job is shown (after insert)
-        self._edit_row_index: Optional[int] = None
 
         # Dynamic column widths for tables
         self.col_widths = {
             "running": {"id": 8, "pid": 6, "gpus": 4, "elapsed": 7},
-            "pending": {"id": 8, "gpus": 4, "prio": 4, "waiting": 7},
+            "staging": {"id": 8, "gpus": 4, "waiting": 7},
+            "pending": {"id": 8, "gpus": 4, "waiting": 7},
             "completed": {"id": 8, "runtime": 7, "ago": 7},
         }
 
     def _calc_col_widths(self):
         """Calculate column widths based on current data for all tables."""
         try:
+            def calc_queue_widths(items: list[dict[str, Any]]) -> dict[str, int]:
+                widths = {"id": 3, "gpus": 4, "waiting": 7}
+                for job in items:
+                    jid = job.get("id", "")[:8]
+                    widths["id"] = max(widths["id"], len(jid))
+                    widths["gpus"] = max(widths["gpus"], len(str(job.get("gpus", 1))))
+                    add_dt = self._parse_iso(job.get("added"))
+                    if add_dt:
+                        waiting = self._fmt_delta(datetime.now() - add_dt)
+                        widths["waiting"] = max(widths["waiting"], len(waiting))
+                for key in widths:
+                    widths[key] += 1
+                return widths
+
             # Running table
             running_w = {"id": 3, "pid": 3, "gpus": 4, "elapsed": 7}
             for job in self.data.get("running", []):
@@ -949,16 +973,9 @@ class GPUQueueTUI:
                     elapsed = self._fmt_delta(datetime.now() - start_dt)
                     running_w["elapsed"] = max(running_w["elapsed"], len(elapsed))
 
-            # Pending table
-            pending_w = {"id": 3, "gpus": 4, "prio": 4, "waiting": 7}
-            for job in self.data.get("pending", []):
-                jid = job.get("id", "")[:8]
-                pending_w["id"] = max(pending_w["id"], len(jid))
-                pending_w["gpus"] = max(pending_w["gpus"], len(str(job.get("gpus", 1))))
-                add_dt = self._parse_iso(job.get("added"))
-                if add_dt:
-                    waiting = self._fmt_delta(datetime.now() - add_dt)
-                    pending_w["waiting"] = max(pending_w["waiting"], len(waiting))
+            # Staging + Pending tables
+            staging_w = calc_queue_widths(self.data.get("staging", []))
+            pending_w = calc_queue_widths(self.data.get("pending", []))
 
             # Completed table
             completed_w = {"id": 3, "runtime": 7, "ago": 7}
@@ -977,13 +994,12 @@ class GPUQueueTUI:
             # Add padding
             for key in running_w:
                 running_w[key] += 1
-            for key in pending_w:
-                pending_w[key] += 1
             for key in completed_w:
                 completed_w[key] += 1
 
             self.col_widths = {
                 "running": running_w,
+                "staging": staging_w,
                 "pending": pending_w,
                 "completed": completed_w,
             }
@@ -1182,41 +1198,18 @@ class GPUQueueTUI:
                 f"{gpus:<{cw['gpus']}} {elapsed:<{cw['elapsed']}} "
             )
 
-        elif job["_type"] == "pending":
-            # Format: ID(8) | PRIO(6) | WAITING(9) | CMD
-            # Pending items usually white.
-
+        elif job["_type"] in ["staging", "pending"]:
             gpus = str(job.get("gpus", 1))
-            p = job.get("priority", 1)
-            p_s = ["L", "M", "H", "U"][min(p, 3)]
-
             waiting = "-"
             add_dt = self._parse_iso(job.get("added"))
             if add_dt:
                 waiting = self._fmt_delta(datetime.now() - add_dt)
 
-            # Construct fields individually for highlighting
-            # available_width = max_width - fixed_columns
-            # Highlighting enabled by wrapping active field
-
-            # To ensure visibility if colors fail, let's add markers or brackets?
-            # But brackets change length.
-            # Maybe just keep exact length but use background color.
-            # User said "definitely not blinking and don't know what field".
-            # So let's use brackets OR arrows if length permits.
-            # Changing length breaks column alignment unless we account for it.
-            # Simple approach: Exact length, rely on REVERSE.
-
-            # Highlighting via REVERSE
-            # If REVERSE isn't showing, maybe the terminal is weird.
-            # Let's try adding explicit indicators.
-
             # Use dynamic column widths
-            cw = self.col_widths["pending"]
-            prefix = (
-                f" {jid:<{cw['id']}} {gpus:<{cw['gpus']}} "
-                f"{p_s:<{cw['prio']}} {waiting:<{cw['waiting']}} "
-            )
+            cw = self.col_widths["staging" if job["_type"] == "staging" else "pending"]
+            if job["_type"] == "staging":
+                color = curses.color_pair(4)
+            prefix = f" {jid:<{cw['id']}} {gpus:<{cw['gpus']}} {waiting:<{cw['waiting']}} "
 
         else:
             # Completed/Finished
@@ -1256,9 +1249,8 @@ class GPUQueueTUI:
 
         full_line = prefix + cmd
 
-        if is_editing and job["_type"] == "pending":
-            # Use dynamic column widths for edit mode too
-            cw = self.col_widths["pending"]
+        if is_editing and job["_type"] == "staging":
+            cw = self.col_widths["staging"]
 
             # Field 0: GPUS
             if edit_idx == 0:
@@ -1267,20 +1259,11 @@ class GPUQueueTUI:
             else:
                 s_gpus = f"{gpus:<{cw['gpus']}} "
 
-            # Field 1: PRIO
-            if edit_idx == 1:
-                s_val = f"[{p_s}]"
-                s_prio = f"{s_val:<{cw['prio'] + 1}}"
-            else:
-                s_prio = f"{p_s:<{cw['prio']}} "
-
-            head = (
-                f" {jid:<{cw['id']}} " + s_gpus + s_prio + f"{waiting:<{cw['waiting']}} "
-            )
+            head = f" {jid:<{cw['id']}} " + s_gpus + f"{waiting:<{cw['waiting']}} "
             cmd_avail = max(1, w - len(head))
 
             cmd_stripped = (job.get("cmd", "") or "").strip()
-            if edit_idx == 2:
+            if edit_idx == 1:
                 disp = cmd_stripped if cmd_stripped else CMD_FIELD_GHOST
                 if len(disp) > cmd_avail:
                     disp = disp[: max(0, cmd_avail - 1)] + "…"
@@ -1298,7 +1281,6 @@ class GPUQueueTUI:
                 "segments": [
                     (f" {jid:<{cw['id']}} ", curses.A_NORMAL),
                     (s_gpus, curses.A_REVERSE if edit_idx == 0 else curses.A_NORMAL),
-                    (s_prio, curses.A_REVERSE if edit_idx == 1 else curses.A_NORMAL),
                     (f"{waiting:<{cw['waiting']}} ", curses.A_NORMAL),
                     (disp, cmd_attr),
                 ],
@@ -1365,57 +1347,51 @@ class GPUQueueTUI:
             # Calculate heights
             avail_h = h - 2  # -1 for header, -1 for footer
 
-            # --- Dynamic Sizing Logic ---
-            # 1. GPU Status: Content + 2 (border)
-            gpu_h = 0
-            if not self.windows[3].collapsed:
-                gpu_content_len = len(self.gpu_status) if self.gpu_status else 1
-                gpu_h = min(
-                    gpu_content_len + 3, avail_h // 3
-                )  # +3 for Border(2) + Header(1)
-                gpu_h = max(3, gpu_h)  # Min height
-            else:
-                gpu_h = 1
+            win_by_key = {win.key: win for win in self.windows}
 
-            # 2. Running: Content + 2 (border)
-            running_h = 0
-            if not self.windows[0].collapsed:
+            # --- Dynamic Sizing Logic ---
+            gpu_h = 1
+            if not win_by_key["gpu_status"].collapsed:
+                gpu_content_len = len(self.gpu_status) if self.gpu_status else 1
+                gpu_h = min(gpu_content_len + 3, max(3, avail_h // 3))
+                gpu_h = max(3, gpu_h)
+
+            running_h = 1
+            if not win_by_key["running"].collapsed:
                 running_items = len(self.data.get("running", []))
                 running_content_len = running_items + 1  # +1 for header
-                running_h = min(running_content_len + 2, avail_h // 3)  # +2 for border
+                running_h = min(running_content_len + 2, max(3, avail_h // 3))
                 running_h = max(3, running_h)
-            else:
-                running_h = 1
 
-            # 3. Selected Job: Fixed small
-            job_h = 0
-            if not self.windows[4].collapsed:
-                job_h = 8  # Fixed small size
-            else:
-                job_h = 1
+            job_h = 1 if win_by_key["job_details"].collapsed else 8
 
-            # 4. Pending & Completed share the rest
+            queue_keys = ["staging", "pending", "completed"]
             used_h = gpu_h + running_h + job_h
-            remaining_h = max(0, avail_h - used_h)
-
-            pending_h = 0
-            completed_h = 0
-
-            if not self.windows[1].collapsed and not self.windows[2].collapsed:
-                pending_h = remaining_h // 2
-                completed_h = remaining_h - pending_h
-            elif self.windows[1].collapsed and not self.windows[2].collapsed:
-                pending_h = 1
-                completed_h = remaining_h - 1
-            elif not self.windows[1].collapsed and self.windows[2].collapsed:
-                pending_h = remaining_h - 1
-                completed_h = 1
+            remaining_h = max(3, avail_h - used_h)
+            visible_queue_keys = [
+                k for k in queue_keys if not win_by_key[k].collapsed
+            ]
+            heights_by_key = {
+                "running": running_h,
+                "gpu_status": gpu_h,
+                "job_details": job_h,
+            }
+            if visible_queue_keys:
+                base_h = max(1, remaining_h // len(visible_queue_keys))
+                extra = max(0, remaining_h - (base_h * len(visible_queue_keys)))
+                for k in queue_keys:
+                    if win_by_key[k].collapsed:
+                        heights_by_key[k] = 1
+                    else:
+                        add = 1 if extra > 0 else 0
+                        heights_by_key[k] = base_h + add
+                        if extra > 0:
+                            extra -= 1
             else:
-                pending_h = 1
-                completed_h = 1
+                for k in queue_keys:
+                    heights_by_key[k] = 1
 
-            # Assign calculated heights
-            heights = [running_h, pending_h, completed_h, gpu_h, job_h]
+            heights = [heights_by_key[win.key] for win in self.windows]
 
             current_y = 1
             for i, win in enumerate(self.windows):
@@ -1671,7 +1647,7 @@ class GPUQueueTUI:
             # Find which job is "selected" across the 3 main windows
             # Or just use the one from the active window if it's a queue
             job = None
-            if self.active_win_idx < 3:
+            if self.active_win_idx < 4:
                 job = self.windows[self.active_win_idx].get_selected()
             else:
                 # Search all for the "first" non-focused selection?
@@ -1685,11 +1661,10 @@ class GPUQueueTUI:
             self.last_selected_job = job  # Keep it
 
             jid = job["id"]
-            st = job.get("status", "unk")
-            prio = job.get("priority", 1)
-            prio_s = ["Low", "Med", "High", "Urgent"][min(prio, 3)]
-
-            meta_str = f"ID: {jid} | Status: {st.upper()} | Prio: {prio_s}"
+            queue_s = str(job.get("_type", "unk")).upper()
+            st = str(job.get("status", "-")).upper()
+            gpu_s = str(job.get("gpus", "-"))
+            meta_str = f"ID: {jid} | Queue: {queue_s} | Status: {st} | GPUs: {gpu_s}"
             self.stdscr.addstr(y, x + 2, meta_str, curses.A_BOLD)
 
             cmd = job.get("cmd", "")
@@ -1751,7 +1726,7 @@ class GPUQueueTUI:
 
             # Title
             count_str = ""
-            if win.key in ["running", "pending", "completed"]:
+            if win.key in ["running", "staging", "pending", "completed"]:
                 count_str = f"[{len(win.items)}]"
 
             title_s = f" {win.title} {count_str} "
@@ -1785,12 +1760,18 @@ class GPUQueueTUI:
                     f" {'ID':<{cw['id']}} {'PID':<{cw['pid']}} "
                     f"{'GPUS':<{cw['gpus']}} {'ELAPSED':<{cw['elapsed']}} CMD"
                 )
+            elif win.key == "staging":
+                cw = self.col_widths["staging"]
+                hdr = (
+                    f" {'ID':<{cw['id']}} {'GPUS':<{cw['gpus']}} "
+                    f"{'WAITING':<{cw['waiting']}} CMD"
+                )
             elif win.key == "pending":
                 # Dynamic header based on column widths
                 cw = self.col_widths["pending"]
                 hdr = (
                     f" {'ID':<{cw['id']}} {'GPUS':<{cw['gpus']}} "
-                    f"{'PRIO':<{cw['prio']}} {'WAITING':<{cw['waiting']}} CMD"
+                    f"{'WAITING':<{cw['waiting']}} CMD"
                 )
             elif win.key == "completed":
                 # Dynamic header based on column widths
@@ -1806,36 +1787,18 @@ class GPUQueueTUI:
             # List items
             display_items = list(win.items)
 
-            # 1. NEW EDIT JOB INJECTION
+            # Edit-mode row swap in staging only
             if (
                 active
                 and self.edit_mode_active
-                and self.edit_is_new
                 and self.edit_job
-                and win.key == "pending"
+                and win.key == "staging"
             ):
-                self.edit_job["_edit_field_idx"] = self.edit_field_idx
-                insert_at = (
-                    self._edit_row_index
-                    if self._edit_row_index is not None
-                    else min(win.selected_idx + 1, len(display_items))
-                )
-                insert_at = max(0, min(insert_at, len(display_items)))
-                display_items.insert(insert_at, self.edit_job)
-
-            # 2. EXISTING JOB SWAP
-            elif (
-                active
-                and self.edit_mode_active
-                and not self.edit_is_new
-                and self.edit_job
-                and win.key == "pending"
-            ):
-                # Find the job in display_items and replace it
-                self.edit_job["_edit_field_idx"] = self.edit_field_idx
+                edit_copy = copy.deepcopy(self.edit_job)
+                edit_copy["_edit_field_idx"] = self.edit_field_idx
                 for idx, it in enumerate(display_items):
-                    if it["id"] == self.edit_job["id"]:
-                        display_items[idx] = self.edit_job
+                    if it["id"] == edit_copy["id"]:
+                        display_items[idx] = edit_copy
                         break
 
             # Recalculate list height or just use what we have
@@ -1854,36 +1817,16 @@ class GPUQueueTUI:
             for i, item in enumerate(visible_items):
                 abs_idx = win.scroll_offset + i
 
-                # Check if this is the injected draft row
-                is_injected = item.get("id") in ("EDITING", "NEW")
-
-                # Selection logic: draft row sits at _edit_row_index (or insert_at)
                 is_sel = False
                 if active:
-                    if (
-                        self.edit_mode_active
-                        and self.edit_is_new
-                        and win.key == "pending"
-                        and self._edit_row_index is not None
-                    ):
-                        if abs_idx == self._edit_row_index:
-                            is_sel = True
-                    else:
-                        if abs_idx == win.selected_idx:
-                            is_sel = True
-
-                if (
-                    self.edit_mode_active
-                    and self.edit_job is not None
-                    and item is self.edit_job
-                ):
-                    item["_edit_field_idx"] = self.edit_field_idx
+                    if abs_idx == win.selected_idx:
+                        is_sel = True
 
                 line_res, line_col = self.format_job_line(item, w - 2)
 
                 draw_style = curses.A_NORMAL
                 if is_sel:
-                    if focused and not is_injected:
+                    if focused:
                         draw_style = curses.A_REVERSE
                     else:
                         # In NAV mode, pass or different style
@@ -1935,19 +1878,21 @@ class GPUQueueTUI:
             help_str = " Q:Quit "
             if self.edit_mode_active:
                 help_str += (
-                    "e:Confirm  Esc:Cancel  h/l:Field  j/k:Value  Enter:command editor"
+                    "e:Save Staging  Esc:Cancel  h/l:Field  j/k:GPUs  Enter:command editor"
                 )
             elif self.mode == "NAV":
                 help_str += "j/k:Select  l:Focus  n:New Job  Tab:Collapse"
             else:
                 # Context-aware help based on active window
                 win = self.windows[self.active_win_idx]
-                if win.key == "pending":
-                    help_str += "h:Back  Space:Log  c:Cancel  e:Edit  d:Dup  n:New"
+                if win.key == "staging":
+                    help_str += "h:Back  c:Discard  e:Edit  s:Send  d:Dup  n:New"
+                elif win.key == "pending":
+                    help_str += "h:Back  c:Cancel  J/K:Reorder  Space:Log"
                 elif win.key == "running":
                     help_str += "h:Back  Space:Log  c:Cancel  p:Pause  d:Dup"
                 elif win.key == "completed":
-                    help_str += "h:Back  Space:Log  r:Retry  x:Delete  d:Dup"
+                    help_str += "h:Back  Space:Log  r:Stage Retry  x:Delete  d:Dup"
                 else:
                     help_str += "h:Back  Space:Log  d:Dup  n:New"
 
@@ -2180,33 +2125,22 @@ class GPUQueueTUI:
                     if ch == 27:  # Esc -> Cancel
                         self.edit_mode_active = False
                         self.edit_job = None
-                        self._edit_row_index = None
                     elif ch == ord("e"):  # Confirm
                         if self.edit_job is None:
                             continue
-                        if self.edit_is_new:
-                            self.add_job_internal(
-                                self.edit_job["cmd"],
-                                self.edit_job["gpus"],
-                                self.edit_job["priority"],
-                            )
-                        else:
-                            # Update existing job
-                            self.execute_action(
-                                "update_job",
-                                self.edit_job["id"],
-                                cmd=self.edit_job["cmd"],
-                                gpus=self.edit_job["gpus"],
-                                priority=self.edit_job["priority"],
-                            )
+                        self.execute_action(
+                            "update_staging",
+                            self.edit_job["id"],
+                            cmd=self.edit_job["cmd"],
+                            gpus=self.edit_job["gpus"],
+                        )
                         self.edit_mode_active = False
                         self.edit_job = None
-                        self._edit_row_index = None
 
                     elif ch == ord("h"):  # Cycle Left
                         self.edit_field_idx = max(0, self.edit_field_idx - 1)
                     elif ch == ord("l"):  # Cycle Right
-                        self.edit_field_idx = min(2, self.edit_field_idx + 1)
+                        self.edit_field_idx = min(1, self.edit_field_idx + 1)
 
                     elif ch == ord("j"):  # Decrease Value
                         if self.edit_job is None:
@@ -2215,24 +2149,15 @@ class GPUQueueTUI:
                             self.edit_job["gpus"] = max(
                                 1, int(self.edit_job["gpus"]) - 1
                             )
-                        elif self.edit_field_idx == 1:  # Prio
-                            self.edit_job["priority"] = max(
-                                0, int(self.edit_job["priority"]) - 1
-                            )
 
                     elif ch == ord("k"):  # Increase Value
                         if self.edit_job is None:
                             continue
                         if self.edit_field_idx == 0:  # GPUS
                             self.edit_job["gpus"] = int(self.edit_job["gpus"]) + 1
-                            # Assuming no hard max, or maybe max_gpus from status?
-                        elif self.edit_field_idx == 1:  # Prio
-                            self.edit_job["priority"] = min(
-                                3, int(self.edit_job["priority"]) + 1
-                            )
 
                     elif ch == 10 or ch == ord("i"):  # Enter/Edit Text
-                        if self.edit_field_idx == 2:  # Command
+                        if self.edit_field_idx == 1:  # Command
                             self.prompt_edit_command()
 
                     continue
@@ -2298,8 +2223,8 @@ class GPUQueueTUI:
                         self.action_open_external_logs()
 
                     # Actions (context-aware per window type)
-                    elif ch == ord("c"):  # Cancel (pending/running only)
-                        if win.key in ["pending", "running"]:
+                    elif ch == ord("c"):
+                        if win.key in ["staging", "pending", "running"]:
                             self.do_action("cancel")
                     elif ch == ord("x"):  # Remove/Delete (completed only)
                         if win.key == "completed":
@@ -2311,12 +2236,24 @@ class GPUQueueTUI:
                     elif ch == ord("p"):  # Pause (running only)
                         if win.key == "running":
                             self.do_action("pause")
-                    elif ch == ord("e"):  # Edit (pending only)
-                        if win.key == "pending":
+                    elif ch == ord("e"):  # Edit (staging only)
+                        if win.key == "staging":
                             self.do_action("edit")
                     elif ch == ord("r"):  # Retry (completed only)
                         if win.key == "completed":
                             self.do_action("retry")
+                    elif ch == ord("s"):  # Send staged job to pending
+                        if win.key == "staging":
+                            self.do_action("send_to_pending")
+                    elif ch == ord("J"):  # Move pending job down
+                        if win.key == "pending":
+                            self.do_action("move_pending_down")
+                    elif ch == ord("K"):  # Move pending job up
+                        if win.key == "pending":
+                            self.do_action("move_pending_up")
+                    elif ch == 10:  # Enter sends staged job to pending (with confirm)
+                        if win.key == "staging":
+                            self.do_action("send_to_pending")
 
         finally:
             self.stop()
@@ -2379,27 +2316,28 @@ class GPUQueueTUI:
             self.edit_job["cmd"] = val
 
     def prompt_new_job(self):
-        if self.stdscr is None:
-            return
-        # Instead of modal, start Edit Mode with defaults
-        self.edit_job = {
-            "id": "NEW",
-            "_type": "pending",
+        now = datetime.now().isoformat()
+        job = {
+            "id": generate_job_id(),
             "cmd": "",
             "gpus": 1,
-            "priority": 1,  # Low
-            "added": datetime.now().isoformat(),
+            "added": now,
+            "staged_at": now,
         }
+        with locked_queue() as q:
+            q["staging"].append(job)
+
+        self.edit_job = copy.deepcopy(job)
+        self.edit_job["_type"] = "staging"
         self.edit_is_new = True
         self.edit_mode_active = True
         self.edit_field_idx = 0
 
-        # Switch to PENDING window if not already there
         for i, w in enumerate(self.windows):
-            if w.key == "pending":
+            if w.key == "staging":
                 self.active_win_idx = i
-                # Insert draft after selection; empty queue -> row 0 (was broken: 1 <= 0)
-                self._edit_row_index = min(w.selected_idx + 1, len(w.items))
+                if w.items:
+                    w.selected_idx = len(w.items) - 1
                 break
 
     def prompt_change_gpus(self):
@@ -2426,12 +2364,20 @@ class GPUQueueTUI:
         if not job:
             return
 
-        jid = job["id"]
+        jid = job["id"] if job else ""
 
         # Actions that require modals
         if action == "cancel":
-            # Cancel only works for pending/running
-            if win.key not in ["pending", "running"]:
+            if win.key not in ["staging", "pending", "running"]:
+                return
+            if win.key == "staging":
+                self.modal = {
+                    "type": "CONFIRM",
+                    "title": "Discard Staged Job",
+                    "text": f"Discard staged job {jid}?",
+                    "on_confirm": lambda: self.execute_action("discard_staging", jid),
+                    "on_cancel": None,
+                }
                 return
 
             self.modal = {
@@ -2455,30 +2401,50 @@ class GPUQueueTUI:
             return
 
         elif action == "edit":
-            # Edit only works for pending (already checked in keybinding)
+            # Edit only works for staging (already checked in keybinding)
             self.edit_job = copy.deepcopy(job)
-            self.edit_job["_type"] = "pending"
+            self.edit_job["_type"] = "staging"
             self.edit_is_new = False
-            self._edit_row_index = None
             self.edit_mode_active = True
             self.edit_field_idx = 0
             return
 
         elif action == "dup":
-            self.edit_job = copy.deepcopy(job)
-            self.edit_job["id"] = "EDITING"  # Temp ID
-            self.edit_job["_type"] = "pending"  # Force type to pending for rendering
+            now = datetime.now().isoformat()
+            dup_job = {
+                "id": generate_job_id(),
+                "cmd": job.get("cmd", ""),
+                "gpus": job.get("gpus", 1),
+                "added": now,
+                "staged_at": now,
+            }
+            with locked_queue() as q:
+                q["staging"].append(dup_job)
+            self.edit_job = copy.deepcopy(dup_job)
+            self.edit_job["_type"] = "staging"
             self.edit_is_new = True
             self.edit_mode_active = True
             self.edit_field_idx = 0
 
-            # Switch to PENDING window if not already there, as new jobs go there
+            # Switch to STAGING window
             for i, w in enumerate(self.windows):
-                if w.key == "pending":
+                if w.key == "staging":
                     self.active_win_idx = i
-                    self._edit_row_index = min(w.selected_idx + 1, len(w.items))
+                    if w.items:
+                        w.selected_idx = len(w.items) - 1
                     break
 
+            return
+        elif action == "send_to_pending":
+            if win.key != "staging":
+                return
+            self.modal = {
+                "type": "CONFIRM",
+                "title": "Send To Pending",
+                "text": f"Send job {jid} to pending queue?",
+                "on_confirm": lambda: self.execute_action("send_to_pending", jid),
+                "on_cancel": None,
+            }
             return
 
         # Immediate actions
@@ -2533,20 +2499,6 @@ class GPUQueueTUI:
                 )
                 msg = f"Pausing {jid}..."
 
-            elif action == "priority_up" or action == "priority_down":
-                with locked_queue() as q:
-                    for job in q["pending"]:
-                        if job["id"] == jid:
-                            p = job.get("priority", 1)
-                            if action == "priority_up":
-                                job["priority"] = min(3, p + 1)
-                                dir_s = "Increased"
-                            else:
-                                job["priority"] = max(0, p - 1)
-                                dir_s = "Decreased"
-                            msg = f"{dir_s} priority of {jid} to {job['priority']}"
-                            break
-
             elif action == "retry":
                 with locked_queue() as q:
                     for i, j in enumerate(q["completed"]):
@@ -2554,32 +2506,77 @@ class GPUQueueTUI:
                             job = q["completed"].pop(i)
                             # Reset job for re-queue
                             new_job = {
-                                "id": job["id"],  # Keep same ID
+                                "id": generate_job_id(),
                                 "cmd": job["cmd"],
                                 "gpus": job.get("gpus", 1),
                                 "added": datetime.now().isoformat(),
-                                "priority": 1,  # Medium priority
+                                "staged_at": datetime.now().isoformat(),
                             }
-                            q["pending"].append(new_job)
-                            msg = f"Re-queued {jid}"
+                            q["staging"].append(new_job)
+                            msg = f"Staged retry for {jid}"
                             break
 
-            elif action == "update_job":
+            elif action == "update_staging":
                 cmd = kwargs.get("cmd")
                 gpus = kwargs.get("gpus")
-                prio = kwargs.get("priority")
 
                 with locked_queue() as q:
-                    for job in q["pending"]:
+                    for job in q["staging"]:
                         if job["id"] == jid:
-                            if cmd:
+                            if cmd is not None:
                                 job["cmd"] = cmd
-                            if gpus:
+                            if gpus is not None:
                                 job["gpus"] = gpus
-                            if prio is not None:
-                                job["priority"] = prio
-                            msg = f"Updated job {jid}"
+                            msg = f"Updated staged job {jid}"
                             break
+
+            elif action == "send_to_pending":
+                with locked_queue() as q:
+                    for i, job in enumerate(q["staging"]):
+                        if job["id"] == jid:
+                            moved = q["staging"].pop(i)
+                            moved["added"] = datetime.now().isoformat()
+                            q["pending"].append(moved)
+                            msg = f"Sent {jid} to pending"
+                            break
+
+            elif action == "discard_staging":
+                with locked_queue() as q:
+                    for i, job in enumerate(q["staging"]):
+                        if job["id"] == jid:
+                            q["staging"].pop(i)
+                            msg = f"Discarded staged job {jid}"
+                            if self.edit_mode_active and self.edit_job is not None:
+                                if self.edit_job.get("id") == jid:
+                                    self.edit_mode_active = False
+                                    self.edit_job = None
+                            break
+
+            elif action in ["move_pending_up", "move_pending_down"]:
+                with locked_queue() as q:
+                    pending = q["pending"]
+                    idx = -1
+                    for i, job in enumerate(pending):
+                        if job["id"] == jid:
+                            idx = i
+                            break
+                    if idx != -1:
+                        if action == "move_pending_up" and idx > 0:
+                            pending[idx - 1], pending[idx] = pending[idx], pending[idx - 1]
+                            msg = f"Moved {jid} up"
+                            for w in self.windows:
+                                if w.key == "pending":
+                                    w.selected_idx = max(0, w.selected_idx - 1)
+                                    break
+                        elif action == "move_pending_down" and idx < len(pending) - 1:
+                            pending[idx + 1], pending[idx] = pending[idx], pending[idx + 1]
+                            msg = f"Moved {jid} down"
+                            for w in self.windows:
+                                if w.key == "pending":
+                                    w.selected_idx = min(len(pending) - 1, w.selected_idx + 1)
+                                    break
+                        else:
+                            msg = "Cannot move further"
 
         except Exception as e:
             msg = f"Err: {str(e)}"

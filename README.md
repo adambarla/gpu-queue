@@ -42,20 +42,24 @@ A lightweight job queue for shared GPU servers without SLURM.
     gpu-queue watch
     ```
     **Keybindings**:
-    - `d`: **Duplicate** selected job (enters Edit Mode)
-    - `e`: **Edit** selected pending job / **Confirm** changes
-    - `c`: **Cancel** job (Pending -> Cancelled status)
+    - `d`: **Duplicate** selected job into **Staging** (enters Edit Mode)
+    - `n`: Create a **new staged** job
+    - `e`: **Edit** selected staged job / **Save** staged changes
+    - `s` or `Enter` (in Staging): Send staged job to **Pending** (with confirmation)
+    - `c`: **Discard** staged job, or cancel pending/running job
+    - `J` / `K` (in Pending): Move selected job down/up in queue order
     - `Space`: View logs (internal viewer)
     - `L`: View logs in **external viewer** (`less`)
     - `p`: Pause/Resume running job
-    - `r`: Remove completed job
+    - `r`: Retry completed job into **Staging**
+    - `x`: Remove completed job
 
     **Interactive Editing**:
-    - **Enter Edit Mode**: Press `e` on a pending job or `d` to duplicate.
-    - **Navigation**: Use `h`/`l` to switch between GPUs, Priority, and Command fields.
-    - **Modify Values**: Use `j`/`k` to increase/decrease values.
+    - **Enter Edit Mode**: Press `e` on a staged job, or create one via `n` / `d` / `r`.
+    - **Navigation**: Use `h`/`l` to switch between GPUs and Command fields.
+    - **Modify Values**: Use `j`/`k` to decrease/increase GPU count.
     - **Edit Command**: Select the Command field and press `Enter` to open your system editor.
-    - **Confirm**: Press `e` to save changes.
+    - **Save**: Press `e` to save staged changes.
     - **Cancel**: Press `Esc` to discard changes.
 
 ## Development Setup
