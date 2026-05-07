@@ -50,6 +50,8 @@ POLL_INTERVAL = 2  # seconds between GPU checks
 MIN_FREE_GPUS = 2  # Number of GPUs to always keep free for other users
 SERVER_PORT = 12345
 
+CMD_FIELD_GHOST = "<press enter to edit command>"
+
 # Sparkline for GPU util (U+2581..U+2588). Buffer ≥ max spark columns so full width scrolls.
 _BLOCK_SPARK_CHARS = "▁▂▃▄▅▆▇█"
 GPU_UTIL_HISTORY_MAX_SAMPLES = 512
@@ -921,6 +923,8 @@ class GPUQueueTUI:
         self.edit_job = None
         self.edit_field_idx = 0  # 0: GPUs, 1: Priority, 2: Command
         self.edit_is_new = False
+        # Row index in pending list where draft new/duplicate job is shown (after insert)
+        self._edit_row_index: Optional[int] = None
 
         # Dynamic column widths for tables
         self.col_widths = {
@@ -1245,7 +1249,7 @@ class GPUQueueTUI:
                 f" {jid:<{cw['id']}} {run_s:<{cw['runtime']}} {ago_s:<{cw['ago']}} "
             )
 
-        cmd = job.get("cmd", "")
+        cmd = job.get("cmd", "") or ""
         avail_cmd = w - len(prefix)
         if len(cmd) > avail_cmd:
             cmd = cmd[: (avail_cmd - 1)] + "…"
@@ -1270,7 +1274,24 @@ class GPUQueueTUI:
             else:
                 s_prio = f"{p_s:<{cw['prio']}} "
 
-            # Field 2: CMD - just highlight it
+            head = (
+                f" {jid:<{cw['id']}} " + s_gpus + s_prio + f"{waiting:<{cw['waiting']}} "
+            )
+            cmd_avail = max(1, w - len(head))
+
+            cmd_stripped = (job.get("cmd", "") or "").strip()
+            if edit_idx == 2:
+                disp = cmd_stripped if cmd_stripped else CMD_FIELD_GHOST
+                if len(disp) > cmd_avail:
+                    disp = disp[: max(0, cmd_avail - 1)] + "…"
+                disp = disp.ljust(cmd_avail)[:cmd_avail]
+                cmd_attr = curses.A_REVERSE
+            else:
+                disp = cmd_stripped
+                if len(disp) > cmd_avail:
+                    disp = disp[: max(0, cmd_avail - 1)] + "…"
+                disp = disp.ljust(cmd_avail)[:cmd_avail]
+                cmd_attr = curses.A_NORMAL
 
             return {
                 "type": "rich",
@@ -1279,9 +1300,9 @@ class GPUQueueTUI:
                     (s_gpus, curses.A_REVERSE if edit_idx == 0 else curses.A_NORMAL),
                     (s_prio, curses.A_REVERSE if edit_idx == 1 else curses.A_NORMAL),
                     (f"{waiting:<{cw['waiting']}} ", curses.A_NORMAL),
-                    (cmd, curses.A_REVERSE if edit_idx == 2 else curses.A_NORMAL),
+                    (disp, cmd_attr),
                 ],
-                "base_color": color | curses.A_BLINK,
+                "base_color": color,
             }, color
 
         return full_line, color
@@ -1794,9 +1815,13 @@ class GPUQueueTUI:
                 and win.key == "pending"
             ):
                 self.edit_job["_edit_field_idx"] = self.edit_field_idx
-                target_idx = win.selected_idx + 1
-                if target_idx <= len(display_items):
-                    display_items.insert(target_idx, self.edit_job)
+                insert_at = (
+                    self._edit_row_index
+                    if self._edit_row_index is not None
+                    else min(win.selected_idx + 1, len(display_items))
+                )
+                insert_at = max(0, min(insert_at, len(display_items)))
+                display_items.insert(insert_at, self.edit_job)
 
             # 2. EXISTING JOB SWAP
             elif (
@@ -1829,24 +1854,30 @@ class GPUQueueTUI:
             for i, item in enumerate(visible_items):
                 abs_idx = win.scroll_offset + i
 
-                # Check if this is the injected item
-                is_injected = item.get("id") == "EDITING"
+                # Check if this is the injected draft row
+                is_injected = item.get("id") in ("EDITING", "NEW")
 
-                # Selection logic:
-                # If editing new job, visual selection is on injected item (rel idx + 1)
-
+                # Selection logic: draft row sits at _edit_row_index (or insert_at)
                 is_sel = False
                 if active:
                     if (
                         self.edit_mode_active
                         and self.edit_is_new
                         and win.key == "pending"
+                        and self._edit_row_index is not None
                     ):
-                        if abs_idx == win.selected_idx + 1:
+                        if abs_idx == self._edit_row_index:
                             is_sel = True
                     else:
                         if abs_idx == win.selected_idx:
                             is_sel = True
+
+                if (
+                    self.edit_mode_active
+                    and self.edit_job is not None
+                    and item is self.edit_job
+                ):
+                    item["_edit_field_idx"] = self.edit_field_idx
 
                 line_res, line_col = self.format_job_line(item, w - 2)
 
@@ -1904,7 +1935,7 @@ class GPUQueueTUI:
             help_str = " Q:Quit "
             if self.edit_mode_active:
                 help_str += (
-                    "e:Confirm  Esc:Cancel  h/l:Field  j/k:Value  Enter:Edit Command"
+                    "e:Confirm  Esc:Cancel  h/l:Field  j/k:Value  Enter:command editor"
                 )
             elif self.mode == "NAV":
                 help_str += "j/k:Select  l:Focus  n:New Job  Tab:Collapse"
@@ -2149,6 +2180,7 @@ class GPUQueueTUI:
                     if ch == 27:  # Esc -> Cancel
                         self.edit_mode_active = False
                         self.edit_job = None
+                        self._edit_row_index = None
                     elif ch == ord("e"):  # Confirm
                         if self.edit_job is None:
                             continue
@@ -2169,6 +2201,7 @@ class GPUQueueTUI:
                             )
                         self.edit_mode_active = False
                         self.edit_job = None
+                        self._edit_row_index = None
 
                     elif ch == ord("h"):  # Cycle Left
                         self.edit_field_idx = max(0, self.edit_field_idx - 1)
@@ -2365,6 +2398,8 @@ class GPUQueueTUI:
         for i, w in enumerate(self.windows):
             if w.key == "pending":
                 self.active_win_idx = i
+                # Insert draft after selection; empty queue -> row 0 (was broken: 1 <= 0)
+                self._edit_row_index = min(w.selected_idx + 1, len(w.items))
                 break
 
     def prompt_change_gpus(self):
@@ -2424,6 +2459,7 @@ class GPUQueueTUI:
             self.edit_job = copy.deepcopy(job)
             self.edit_job["_type"] = "pending"
             self.edit_is_new = False
+            self._edit_row_index = None
             self.edit_mode_active = True
             self.edit_field_idx = 0
             return
@@ -2437,10 +2473,10 @@ class GPUQueueTUI:
             self.edit_field_idx = 0
 
             # Switch to PENDING window if not already there, as new jobs go there
-            # Find index of "pending" window
             for i, w in enumerate(self.windows):
                 if w.key == "pending":
                     self.active_win_idx = i
+                    self._edit_row_index = min(w.selected_idx + 1, len(w.items))
                     break
 
             return
