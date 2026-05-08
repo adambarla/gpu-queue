@@ -1042,6 +1042,16 @@ class GPUQueueTUI:
                         for item in items:
                             item["_type"] = type_label
                         w.update_items(items)
+                        if (
+                            w.key == "staging"
+                            and self.edit_mode_active
+                            and self.edit_job is not None
+                        ):
+                            edit_id = self.edit_job.get("id")
+                            for idx, item in enumerate(items):
+                                if item.get("id") == edit_id:
+                                    w.selected_idx = idx
+                                    break
 
                     # Calculate dynamic column widths
                     self._calc_col_widths()
@@ -1208,7 +1218,7 @@ class GPUQueueTUI:
             # Use dynamic column widths
             cw = self.col_widths["staging" if job["_type"] == "staging" else "pending"]
             if job["_type"] == "staging":
-                color = curses.color_pair(4)
+                color = curses.color_pair(7) | curses.A_DIM
             prefix = f" {jid:<{cw['id']}} {gpus:<{cw['gpus']}} {waiting:<{cw['waiting']}} "
 
         else:
@@ -2325,7 +2335,7 @@ class GPUQueueTUI:
             "staged_at": now,
         }
         with locked_queue() as q:
-            q["staging"].append(job)
+            q["staging"].insert(0, job)
 
         self.edit_job = copy.deepcopy(job)
         self.edit_job["_type"] = "staging"
@@ -2336,8 +2346,8 @@ class GPUQueueTUI:
         for i, w in enumerate(self.windows):
             if w.key == "staging":
                 self.active_win_idx = i
-                if w.items:
-                    w.selected_idx = len(w.items) - 1
+                w.selected_idx = 0
+                w.scroll_offset = 0
                 break
 
     def prompt_change_gpus(self):
@@ -2373,9 +2383,9 @@ class GPUQueueTUI:
             if win.key == "staging":
                 self.modal = {
                     "type": "CONFIRM",
-                    "title": "Discard Staged Job",
-                    "text": f"Discard staged job {jid}?",
-                    "on_confirm": lambda: self.execute_action("discard_staging", jid),
+                    "title": "Cancel Staged Job",
+                    "text": f"Cancel staged job {jid}?",
+                    "on_confirm": lambda: self.execute_action("cancel", jid),
                     "on_cancel": None,
                 }
                 return
@@ -2419,7 +2429,7 @@ class GPUQueueTUI:
                 "staged_at": now,
             }
             with locked_queue() as q:
-                q["staging"].append(dup_job)
+                q["staging"].insert(0, dup_job)
             self.edit_job = copy.deepcopy(dup_job)
             self.edit_job["_type"] = "staging"
             self.edit_is_new = True
@@ -2430,8 +2440,8 @@ class GPUQueueTUI:
             for i, w in enumerate(self.windows):
                 if w.key == "staging":
                     self.active_win_idx = i
-                    if w.items:
-                        w.selected_idx = len(w.items) - 1
+                    w.selected_idx = 0
+                    w.scroll_offset = 0
                     break
 
             return
@@ -2458,13 +2468,28 @@ class GPUQueueTUI:
                 # If it's a pending job, move to completed with status 'cancelled'
                 # If it's running, call the external tool
                 is_pending = False
+                is_staging = False
                 with locked_queue() as q:
+                    for j in q["staging"]:
+                        if j["id"] == jid:
+                            is_staging = True
+                            break
                     for j in q["pending"]:
                         if j["id"] == jid:
                             is_pending = True
                             break
 
-                if is_pending:
+                if is_staging:
+                    with locked_queue() as q:
+                        for i, j in enumerate(q["staging"]):
+                            if j["id"] == jid:
+                                job = q["staging"].pop(i)
+                                job["status"] = "cancelled"
+                                job["ended"] = datetime.now().isoformat()
+                                q["completed"].insert(0, job)
+                                msg = f"Cancelled staged {jid}"
+                                break
+                elif is_pending:
                     with locked_queue() as q:
                         for i, j in enumerate(q["pending"]):
                             if j["id"] == jid:
@@ -2512,7 +2537,7 @@ class GPUQueueTUI:
                                 "added": datetime.now().isoformat(),
                                 "staged_at": datetime.now().isoformat(),
                             }
-                            q["staging"].append(new_job)
+                            q["staging"].insert(0, new_job)
                             msg = f"Staged retry for {jid}"
                             break
 
