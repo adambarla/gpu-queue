@@ -29,6 +29,7 @@ dev = [
     "ruff>=0.1.0",
     "pre-commit>=4.3.0",
     "nb-clean>=4.0.0",
+    "pytest>=7.0.0",
 ]
 
 [tool.ty]
@@ -38,3 +39,8 @@ src = ["src"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["gpu_queue"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-v"

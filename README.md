@@ -11,7 +11,7 @@ A lightweight job queue for shared GPU servers without SLURM.
 1.  **Clone the repository**:
     ```bash
     git clone https://github.com/yourusername/gpu-queue.git
-    cd gpu-queue-rs  # or relevant directory
+    cd gpu-queue
     ```
 
 2.  **Install with `uv` (Recommended)**:
