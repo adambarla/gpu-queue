@@ -839,35 +839,52 @@ class Window:
         # Clamp selection
         if self.selected_idx >= len(self.items):
             self.selected_idx = max(0, len(self.items) - 1)
-        # Clamp scroll offset
-        if self.scroll_offset >= len(self.items):
-            self.scroll_offset = max(0, len(self.items) - 1)
+        self.clamp_scroll()
+
+    def visible_item_count(self, h=None):
+        """Return how many list rows are visible at this window height."""
+        effective_h = h if h is not None else getattr(self, "height", None)
+        if effective_h is None:
+            effective_h = 10
+
+        visible_h = max(1, effective_h - 2)
+        if self.key in ["running", "staging", "pending", "completed"]:
+            visible_h = max(1, visible_h - 1)
+        return visible_h
+
+    def clamp_scroll(self, h=None):
+        """Keep the scroll offset valid for the current item count and height."""
+        if not self.items:
+            self.selected_idx = 0
+            self.scroll_offset = 0
+            return
+
+        self.selected_idx = max(0, min(len(self.items) - 1, self.selected_idx))
+        visible_h = self.visible_item_count(h)
+        max_offset = max(0, len(self.items) - visible_h)
+        self.scroll_offset = max(0, min(max_offset, self.scroll_offset))
+
+    def ensure_selected_visible(self, h=None):
+        """Adjust scroll offset so the selected row remains on screen."""
+        self.clamp_scroll(h)
+        if not self.items:
+            return
+
+        visible_h = self.visible_item_count(h)
+        if self.selected_idx < self.scroll_offset:
+            self.scroll_offset = self.selected_idx
+        elif self.selected_idx >= self.scroll_offset + visible_h:
+            self.scroll_offset = self.selected_idx - visible_h + 1
+        self.clamp_scroll(h)
 
     def scroll(self, delta, h=None):
         """Scroll selection by delta."""
         if not self.items:
             return
 
-        # Use stored height if available (more accurate), otherwise fallback
-        effective_h = getattr(self, "height", h)
-        if effective_h is None:
-            effective_h = 10  # Fallback
-
         new_idx = self.selected_idx + delta
         self.selected_idx = max(0, min(len(self.items) - 1, new_idx))
-
-        # Adjust scroll offset to keep selected item in view
-        # visible items = h - 2 (border)
-        visible_h = max(1, effective_h - 2)
-
-        # Account for header in list windows
-        if self.key in ["running", "staging", "pending", "completed"]:
-            visible_h = max(1, visible_h - 1)
-
-        if self.selected_idx < self.scroll_offset:
-            self.scroll_offset = self.selected_idx
-        elif self.selected_idx >= self.scroll_offset + visible_h:
-            self.scroll_offset = self.selected_idx - visible_h + 1
+        self.ensure_selected_visible(h)
 
     def get_selected(self):
         if 0 <= self.selected_idx < len(self.items):
@@ -993,6 +1010,14 @@ class GPUQueueTUI:
         except Exception:
             pass  # Keep existing widths on error
 
+    def _set_data_snapshot(self, queue: dict[str, list]):
+        """Replace local queue data from a freshly mutated queue snapshot."""
+        self.data = copy.deepcopy(queue)
+        self.data["completed"].sort(key=lambda x: x.get("ended", ""), reverse=True)
+        self.last_updated = time.time()
+        self._sync_windows_from_data()
+        self._calc_col_widths()
+
     def _sync_windows_from_data(self):
         for w in self.windows:
             items = self.data.get(w.key, [])
@@ -1035,22 +1060,7 @@ class GPUQueueTUI:
             try:
                 with locked_queue() as q:
                     with self.lock:
-                        self.data = copy.deepcopy(q)
-
-                        # Sort completed by ended time (descending)
-                        # ended field is isoformat string
-                        self.data["completed"].sort(
-                            key=lambda x: x.get("ended", ""), reverse=True
-                        )
-
-                        self.last_updated = time.time()
-
-                # Update window items
-                with self.lock:
-                    self._sync_windows_from_data()
-
-                    # Calculate dynamic column widths
-                    self._calc_col_widths()
+                        self._set_data_snapshot(q)
 
                 time.sleep(0.5)  # Fast update
             except Exception:
@@ -1403,6 +1413,8 @@ class GPUQueueTUI:
                 win.height = wh  # Store actual height for scrolling
                 if wh <= 0:
                     continue  # Skip hidden windows
+                if not win.collapsed:
+                    win.ensure_selected_visible(wh)
 
                 active = i == self.active_win_idx
                 focused = active and self.mode == "ACTION"
@@ -1867,7 +1879,7 @@ class GPUQueueTUI:
                     if k >= sb_pos and k < sb_pos + sb_h:
                         char = "█"
                     try:
-                        self.stdscr.addstr(start_y + k, w - 1, char, color)
+                        self.stdscr.addstr(start_y + k, w - 1, char, curses.A_NORMAL)
                     except Exception:
                         pass
         except Exception:
@@ -2531,18 +2543,29 @@ class GPUQueueTUI:
                                 self.edit_job = None
 
             elif action in ["move_pending_up", "move_pending_down"]:
+                offset = -1 if action == "move_pending_up" else 1
+                new_idx = None
+                queue_snapshot = None
                 with locked_queue() as q:
-                    offset = -1 if action == "move_pending_up" else 1
                     if move_pending_job(q, jid, offset):
                         msg = f"Moved {jid} {'up' if offset < 0 else 'down'}"
-                        for w in self.windows:
-                            if w.key == "pending":
-                                w.selected_idx = max(
-                                    0, min(len(q["pending"]) - 1, w.selected_idx + offset)
-                                )
+                        for idx, job in enumerate(q["pending"]):
+                            if job.get("id") == jid:
+                                new_idx = idx
                                 break
+                        queue_snapshot = copy.deepcopy(q)
                     else:
                         msg = "Cannot move further"
+
+                if queue_snapshot is not None:
+                    with self.lock:
+                        self._set_data_snapshot(queue_snapshot)
+                        for w in self.windows:
+                            if w.key == "pending":
+                                if new_idx is not None:
+                                    w.selected_idx = new_idx
+                                w.ensure_selected_visible()
+                                break
 
         except Exception as e:
             msg = f"Err: {str(e)}"

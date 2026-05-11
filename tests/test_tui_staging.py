@@ -54,6 +54,12 @@ class TuiStagingTest(unittest.TestCase):
                 return i
         raise AssertionError("staging window not found")
 
+    def pending_idx(self, tui: mod.GPUQueueTUI) -> int:
+        for i, win in enumerate(tui.windows):
+            if win.key == "pending":
+                return i
+        raise AssertionError("pending window not found")
+
     def test_prompt_new_job_inserts_on_top(self):
         tui = self.load_tui(
             {
@@ -171,3 +177,58 @@ class TuiStagingTest(unittest.TestCase):
         data = mod.load_queue_raw()
         self.assertEqual([j["id"] for j in data["pending"]], ["p2", "p1", "p3"])
         self.assertEqual(tui.windows[pending_idx].selected_idx, 0)
+
+    def test_pending_reorder_keeps_moved_job_visible_when_moving_up(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job(f"p{i}") for i in range(8)],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        win.height = 5
+        win.selected_idx = 3
+        win.scroll_offset = 3
+
+        tui.execute_action("move_pending_up", "p3")
+
+        data = mod.load_queue_raw()
+        self.assertEqual([j["id"] for j in data["pending"][:4]], ["p0", "p1", "p3", "p2"])
+        self.assertEqual(win.selected_idx, 2)
+        self.assertEqual(win.scroll_offset, 2)
+
+    def test_pending_reorder_updates_window_items_for_rapid_repeated_moves(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1"), _job("p2"), _job("p3"), _job("p4")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        tui.active_win_idx = pending_idx
+        tui.windows[pending_idx].selected_idx = 1
+
+        tui.do_action("move_pending_down")
+        tui.do_action("move_pending_down")
+
+        data = mod.load_queue_raw()
+        self.assertEqual([j["id"] for j in data["pending"]], ["p1", "p3", "p4", "p2"])
+        self.assertEqual(tui.windows[pending_idx].selected_idx, 3)
+
+    def test_scroll_offset_clamps_to_viewport_after_height_change(self):
+        win = mod.Window("PENDING", "pending")
+        win.height = 5
+        win.update_items([_job(f"p{i}") for i in range(5)])
+        win.scroll_offset = 4
+        win.selected_idx = 4
+
+        win.ensure_selected_visible(10)
+
+        self.assertEqual(win.scroll_offset, 0)
+        self.assertEqual(win.selected_idx, 4)
