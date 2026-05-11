@@ -926,6 +926,7 @@ class GPUQueueTUI:
         ]
         self.active_win_idx = 0  # Index in self.windows
         self.mode = "NAV"  # "NAV" (select window) or "ACTION" (interact with window)
+        self.has_selected_job_context = False
 
         # Log view state
         self.viewing_logs = False
@@ -1041,6 +1042,12 @@ class GPUQueueTUI:
         if win.key in ["running", "pending", "staging", "completed"]:
             return win.get_selected()
         return getattr(self, "last_selected_job", None)
+
+    def _enter_action_window(self, win):
+        self.mode = "ACTION"
+        win.collapsed = False
+        if win.key in ["running", "pending", "staging", "completed"]:
+            self.has_selected_job_context = True
 
     def start(self):
         self.running = True
@@ -1380,8 +1387,32 @@ class GPUQueueTUI:
             job_h = 1 if win_by_key["job_details"].collapsed else 8
 
             queue_keys = ["staging", "pending", "completed"]
-            used_h = gpu_h + running_h + job_h
-            remaining_h = max(3, avail_h - used_h)
+            queue_min_h = len(queue_keys)
+            nonqueue_min_heights = {
+                "running": 1 if win_by_key["running"].collapsed else 3,
+                "gpu_status": 1 if win_by_key["gpu_status"].collapsed else 3,
+                "job_details": 1 if win_by_key["job_details"].collapsed else 3,
+            }
+            nonqueue_heights = {
+                "running": running_h,
+                "gpu_status": gpu_h,
+                "job_details": job_h,
+            }
+            while sum(nonqueue_heights.values()) + queue_min_h > avail_h:
+                shrinkable = [
+                    key
+                    for key, height in nonqueue_heights.items()
+                    if height > nonqueue_min_heights[key]
+                ]
+                if not shrinkable:
+                    break
+                key = max(shrinkable, key=lambda k: nonqueue_heights[k])
+                nonqueue_heights[key] -= 1
+
+            running_h = nonqueue_heights["running"]
+            gpu_h = nonqueue_heights["gpu_status"]
+            job_h = nonqueue_heights["job_details"]
+            remaining_h = max(0, avail_h - sum(nonqueue_heights.values()))
             visible_queue_keys = [
                 k for k in queue_keys if not win_by_key[k].collapsed
             ]
@@ -1391,8 +1422,12 @@ class GPUQueueTUI:
                 "job_details": job_h,
             }
             if visible_queue_keys:
-                base_h = max(1, remaining_h // len(visible_queue_keys))
-                extra = max(0, remaining_h - (base_h * len(visible_queue_keys)))
+                collapsed_queue_h = sum(
+                    1 for k in queue_keys if win_by_key[k].collapsed
+                )
+                visible_h = max(0, remaining_h - collapsed_queue_h)
+                base_h = max(1, visible_h // len(visible_queue_keys))
+                extra = max(0, visible_h - (base_h * len(visible_queue_keys)))
                 for k in queue_keys:
                     if win_by_key[k].collapsed:
                         heights_by_key[k] = 1
@@ -1655,8 +1690,7 @@ class GPUQueueTUI:
             return
         """Draw detailed job information for the selected job across all windows."""
         try:
-            # In NAV mode, show placeholder
-            if self.mode == "NAV":
+            if not self.has_selected_job_context:
                 self.stdscr.addstr(y + 1, x + 2, "No job selected.", curses.A_NORMAL)
                 return
 
@@ -1675,7 +1709,8 @@ class GPUQueueTUI:
             st = str(job.get("status", "-")).upper()
             gpu_s = str(job.get("gpus", "-"))
             meta_str = f"ID: {jid} | Queue: {queue_s} | Status: {st} | GPUs: {gpu_s}"
-            self.stdscr.addstr(y, x + 2, meta_str, curses.A_BOLD)
+            inner_w = max(1, w - 4)
+            self.stdscr.addstr(y, x + 2, _fit_text_field(meta_str, inner_w), curses.A_BOLD)
 
             cmd = job.get("cmd", "")
             # Normalize command (remove newlines)
@@ -1690,13 +1725,11 @@ class GPUQueueTUI:
             # So length available = w-4.
             # Subtract prefix.
             # Subtract 2 more for safety.
-            safe_width = w - 6 - len(prefix)
-            if safe_width < 10:
-                safe_width = 10
+            safe_width = max(1, inner_w - len(prefix))
 
             import textwrap
 
-            lines = textwrap.wrap(cmd, width=safe_width)
+            lines = textwrap.wrap(cmd, width=safe_width) or ["-"]
 
             for i, line in enumerate(lines[: h - 1]):
                 self.stdscr.addstr(
@@ -1705,7 +1738,11 @@ class GPUQueueTUI:
                     prefix if i == 0 else " " * len(prefix),
                     curses.A_NORMAL,
                 )
-                self.stdscr.addstr(y + 1 + i, x + 2 + len(prefix), line)
+                self.stdscr.addstr(
+                    y + 1 + i,
+                    x + 2 + len(prefix),
+                    _fit_text_field(line, safe_width),
+                )
         except Exception:
             pass
 
@@ -2197,13 +2234,11 @@ class GPUQueueTUI:
                         # Disable l for non-interactive windows
                         curr_win = self.windows[self.active_win_idx]
                         if curr_win.key not in ["gpu_status", "job_details"]:
-                            self.mode = "ACTION"
-                            curr_win.collapsed = False
+                            self._enter_action_window(curr_win)
                     elif ch == 10:  # Enter
                         curr_win = self.windows[self.active_win_idx]
                         if curr_win.key not in ["gpu_status", "job_details"]:
-                            self.mode = "ACTION"
-                            curr_win.collapsed = False
+                            self._enter_action_window(curr_win)
                     elif ch == 9:  # Tab
                         self.windows[self.active_win_idx].collapsed = not self.windows[
                             self.active_win_idx
@@ -2338,6 +2373,7 @@ class GPUQueueTUI:
                 self.active_win_idx = i
                 w.selected_idx = 0
                 w.scroll_offset = 0
+                self.has_selected_job_context = True
                 break
 
     def prompt_change_gpus(self):
@@ -2427,6 +2463,7 @@ class GPUQueueTUI:
                     self.active_win_idx = i
                     w.selected_idx = 0
                     w.scroll_offset = 0
+                    self.has_selected_job_context = True
                     break
 
             return

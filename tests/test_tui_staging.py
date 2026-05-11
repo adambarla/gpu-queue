@@ -41,6 +41,7 @@ class TuiStagingTest(unittest.TestCase):
         self.write_queue(data)
         tui = mod.GPUQueueTUI(interval=0.1)
         current = mod.load_queue_raw()
+        tui.data = copy.deepcopy(current)
         for win in tui.windows:
             items = copy.deepcopy(current.get(win.key, []))
             for item in items:
@@ -232,3 +233,123 @@ class TuiStagingTest(unittest.TestCase):
 
         self.assertEqual(win.scroll_offset, 0)
         self.assertEqual(win.selected_idx, 4)
+
+    def test_selected_job_panel_renders_current_job_in_nav_mode(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1", cmd="python train.py")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        tui.active_win_idx = pending_idx
+        tui.mode = "NAV"
+        tui.has_selected_job_context = True
+        screen = FakeScreen(10, 80)
+        tui.stdscr = screen
+
+        tui.draw_job_details(1, 0, 6, 80)
+
+        text = screen.text()
+        self.assertIn("ID: p1", text)
+        self.assertIn("python train.py", text)
+
+    def test_selected_job_panel_is_empty_until_a_panel_is_entered(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1", cmd="python train.py")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        tui.active_win_idx = self.pending_idx(tui)
+        tui.mode = "NAV"
+        screen = FakeScreen(10, 80)
+        tui.stdscr = screen
+
+        tui.draw_job_details(1, 0, 6, 80)
+
+        text = screen.text()
+        self.assertIn("No job selected.", text)
+        self.assertNotIn("ID: p1", text)
+
+    def test_draw_layout_stays_onscreen_with_collapsed_queue_window(self):
+        tui = self.load_tui(
+            {
+                "staging": [_job(f"s{i}") for i in range(8)],
+                "pending": [_job(f"p{i}") for i in range(8)],
+                "running": [
+                    {
+                        **_job(f"r{i}"),
+                        "pid": 1000 + i,
+                        "started": "2026-01-01T00:00:00",
+                        "assigned_gpus": [i],
+                    }
+                    for i in range(8)
+                ],
+                "completed": [_job(f"c{i}", status="success") for i in range(8)],
+            }
+        )
+        tui.mode = "ACTION"
+        tui.active_win_idx = self.pending_idx(tui)
+        tui.gpu_status = [
+            {"index": i, "used_mb": 1000, "total_mb": 24000, "util": 50, "processes": []}
+            for i in range(8)
+        ]
+        next(win for win in tui.windows if win.key == "staging").collapsed = True
+        tui.stdscr = FakeScreen(20, 80)
+
+        with patch.object(mod.curses, "color_pair", side_effect=lambda n: n):
+            tui.draw()
+
+        self.assertEqual(tui.stdscr.errors, [])
+
+
+class FakeScreen:
+    def __init__(self, height: int, width: int):
+        self.height = height
+        self.width = width
+        self.calls = []
+        self.errors = []
+
+    def getmaxyx(self):
+        return self.height, self.width
+
+    def erase(self):
+        pass
+
+    def refresh(self):
+        pass
+
+    def attron(self, *_args):
+        pass
+
+    def attroff(self, *_args):
+        pass
+
+    def _check(self, y: int, x: int, length: int):
+        if y < 0 or y >= self.height or x < 0 or x + length > self.width:
+            err = (y, x, length)
+            self.errors.append(err)
+            raise RuntimeError(f"out of bounds: {err}")
+
+    def addstr(self, y: int, x: int, value, *_args):
+        text = str(value)
+        self._check(y, x, len(text))
+        self.calls.append((y, x, text))
+
+    def hline(self, y: int, x: int, _ch, n: int, *_args):
+        self._check(y, x, n)
+
+    def vline(self, y: int, x: int, _ch, n: int, *_args):
+        self._check(y, x, 1)
+        self._check(y + n - 1, x, 1)
+
+    def addch(self, y: int, x: int, _ch, *_args):
+        self._check(y, x, 1)
+
+    def text(self) -> str:
+        return "\n".join(text for _y, _x, text in self.calls)
