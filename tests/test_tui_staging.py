@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from gpu_queue import main as mod
 from gpu_queue import paths
+from gpu_queue.tui import app as tui_app
 
 
 def _job(
@@ -634,7 +635,7 @@ class TuiStagingTest(unittest.TestCase):
         next(win for win in tui.windows if win.key == "staging").collapsed = True
         tui.stdscr = FakeScreen(20, 80)
 
-        with patch.object(mod.curses, "color_pair", side_effect=lambda n: n):
+        with patch.object(tui_app.curses, "color_pair", side_effect=lambda n: n):
             tui.draw()
 
         self.assertEqual(tui.stdscr.errors, [])
