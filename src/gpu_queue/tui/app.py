@@ -16,18 +16,8 @@ from typing import Any, Dict, Optional, Sequence, cast
 
 from gpu_queue import paths
 from gpu_queue.gpu import get_free_gpus
-from gpu_queue.ids import generate_job_id
-from gpu_queue.queue_state import (
-    cancel_staged_job,
-    insert_staged_job,
-    make_staged_job,
-    move_pending_job,
-    move_pending_job_to_staging,
-    move_pending_jobs,
-    send_staged_job_to_pending,
-    stage_completed_retry,
-)
 from gpu_queue.scheduler import cleanup_dead_jobs
+from gpu_queue.service import QueueService
 from gpu_queue.storage import load_queue, locked_queue
 
 CMD_FIELD_GHOST = "<press enter to edit command>"
@@ -236,6 +226,7 @@ class GPUQueueTUI:
         self.stdscr = None
         self.running = False
         self.lock = threading.Lock()
+        self.queue_service = QueueService()
 
         # State
         self.data = {"staging": [], "running": [], "pending": [], "completed": []}
@@ -1815,16 +1806,14 @@ class GPUQueueTUI:
             self.stop()
 
     def add_job_internal(self, cmd, gpus=2, priority=1):
-        job = {
-            "id": generate_job_id(),
-            "cmd": cmd,
-            "gpus": gpus,
-            "added": datetime.now().isoformat(),
-            "priority": priority,
-            "cwd": os.getcwd(),
-        }
-        with locked_queue() as queue:
-            queue["pending"].append(job)
+        priority_name = "medium"
+        if priority <= 0:
+            priority_name = "low"
+        elif priority >= 2:
+            priority_name = "high"
+        job = self.queue_service.add_job(
+            cmd, gpus=gpus, priority=priority_name, cwd=os.getcwd()
+        )
         self.action_msg = f"Added {job['id']}"
         self.msg_clear_time = time.time() + 2.0
 
@@ -1872,9 +1861,7 @@ class GPUQueueTUI:
             self.edit_job["cmd"] = val
 
     def prompt_new_job(self):
-        job = make_staged_job(generate_job_id())
-        with locked_queue() as q:
-            insert_staged_job(q, job)
+        job = self.queue_service.stage_new_job()
 
         self.edit_job = copy.deepcopy(job)
         self.edit_job["_type"] = "staging"
@@ -2046,13 +2033,12 @@ class GPUQueueTUI:
                 str(kwargs.get("focus_jid")) if kwargs.get("focus_jid") else None
             )
             queue_snapshot = None
-            with locked_queue() as q:
-                if move_pending_jobs(q, jids, offset):
-                    queue_snapshot = copy.deepcopy(q)
-                else:
-                    self.action_msg = "Cannot move further"
-                    self.msg_clear_time = time.time() + 2.0
-                    return
+            if self.queue_service.move_pending_bulk(jids, offset):
+                queue_snapshot = self.queue_service.snapshot()
+            else:
+                self.action_msg = "Cannot move further"
+                self.msg_clear_time = time.time() + 2.0
+                return
             if queue_snapshot is not None:
                 with self.lock:
                     self._set_data_snapshot(queue_snapshot)
@@ -2079,35 +2065,14 @@ class GPUQueueTUI:
             return
 
         if action == "dup":
-            created = []
-            with locked_queue() as q:
-                jobs_by_id = {
-                    str(job.get("id")): job
-                    for key in ["running", "pending", "staging", "completed"]
-                    for job in q.get(key, [])
-                }
-                for jid in jids:
-                    job = jobs_by_id.get(jid)
-                    if job is None:
-                        continue
-                    dup_job = make_staged_job(
-                        generate_job_id(), job.get("cmd", ""), job.get("gpus", 1)
-                    )
-                    insert_staged_job(q, dup_job)
-                    created.append(dup_job["id"])
+            created = self.queue_service.duplicate_jobs(jids)
             self.action_msg = f"Duplicated {len(created)} jobs"
             self.msg_clear_time = time.time() + 2.0
             return
 
         if action == "back_to_staging":
-            moved = []
-            queue_snapshot = None
-            with locked_queue() as q:
-                for jid in reversed(jids):
-                    if move_pending_job_to_staging(q, jid):
-                        moved.append(jid)
-                if moved:
-                    queue_snapshot = copy.deepcopy(q)
+            moved = self.queue_service.move_pending_to_staging_bulk(jids)
+            queue_snapshot = self.queue_service.snapshot() if moved else None
             if queue_snapshot is not None:
                 with self.lock:
                     self._set_data_snapshot(queue_snapshot)
@@ -2157,19 +2122,11 @@ class GPUQueueTUI:
                             break
 
                 if is_staging:
-                    with locked_queue() as q:
-                        if cancel_staged_job(q, jid):
-                            msg = f"Cancelled staged {jid}"
+                    if self.queue_service.cancel_staged(jid):
+                        msg = f"Cancelled staged {jid}"
                 elif is_pending:
-                    with locked_queue() as q:
-                        for i, j in enumerate(q["pending"]):
-                            if j["id"] == jid:
-                                job = q["pending"].pop(i)
-                                job["status"] = "cancelled"
-                                job["ended"] = datetime.now().isoformat()
-                                q["completed"].insert(0, job)
-                                msg = f"Cancelled {jid}"
-                                break
+                    if self.queue_service.cancel_pending(jid):
+                        msg = f"Cancelled {jid}"
                 else:
                     # Running job
                     subprocess.Popen(
@@ -2180,12 +2137,8 @@ class GPUQueueTUI:
                     msg = f"Cancelling {jid}..."
 
             elif action == "delete":
-                with locked_queue() as q:
-                    for i, j in enumerate(q["completed"]):
-                        if j["id"] == jid:
-                            q["completed"].pop(i)
-                            msg = f"Deleted {jid}"
-                            break
+                if self.queue_service.delete_completed(jid):
+                    msg = f"Deleted {jid}"
 
             elif action == "pause":
                 subprocess.Popen(
@@ -2196,83 +2149,55 @@ class GPUQueueTUI:
                 msg = f"Pausing {jid}..."
 
             elif action == "dup":
-                with locked_queue() as q:
-                    jobs_by_id = {
-                        str(job.get("id")): job
-                        for key in ["running", "pending", "staging", "completed"]
-                        for job in q.get(key, [])
-                    }
-                    job = jobs_by_id.get(str(jid))
-                    if job is not None:
-                        dup_job = make_staged_job(
-                            generate_job_id(), job.get("cmd", ""), job.get("gpus", 1)
-                        )
-                        insert_staged_job(q, dup_job)
-                        msg = f"Duplicated {jid} to {dup_job['id']}"
+                created = self.queue_service.duplicate_jobs([jid])
+                if created:
+                    msg = f"Duplicated {jid} to {created[0]['id']}"
 
             elif action == "retry":
-                with locked_queue() as q:
-                    for job in q["completed"]:
-                        if job["id"] == jid:
-                            new_job = make_staged_job(
-                                generate_job_id(), job["cmd"], job.get("gpus", 1)
-                            )
-                            if stage_completed_retry(q, jid, new_job):
-                                msg = f"Staged retry for {jid}"
-                            break
+                if self.queue_service.stage_retry(jid):
+                    msg = f"Staged retry for {jid}"
 
             elif action == "update_staging":
                 cmd = kwargs.get("cmd")
                 gpus = kwargs.get("gpus")
 
-                with locked_queue() as q:
-                    for job in q["staging"]:
-                        if job["id"] == jid:
-                            if cmd is not None:
-                                job["cmd"] = cmd
-                            if gpus is not None:
-                                job["gpus"] = gpus
-                            msg = f"Updated staged job {jid}"
-                            break
+                if self.queue_service.update_staged_job(jid, cmd=cmd, gpus=gpus):
+                    msg = f"Updated staged job {jid}"
 
             elif action == "send_to_pending":
-                with locked_queue() as q:
-                    if send_staged_job_to_pending(q, jid):
-                        msg = f"Sent {jid} to pending"
+                if self.queue_service.send_staged_to_pending(jid):
+                    msg = f"Sent {jid} to pending"
 
             elif action == "back_to_staging":
                 queue_snapshot = None
-                with locked_queue() as q:
-                    if move_pending_job_to_staging(q, jid):
-                        msg = f"Moved {jid} to staging"
-                        queue_snapshot = copy.deepcopy(q)
+                if self.queue_service.move_pending_to_staging(jid):
+                    msg = f"Moved {jid} to staging"
+                    queue_snapshot = self.queue_service.snapshot()
                 if queue_snapshot is not None:
                     with self.lock:
                         self._set_data_snapshot(queue_snapshot)
 
             elif action == "discard_staging":
-                with locked_queue() as q:
-                    if cancel_staged_job(q, jid):
-                        msg = f"Discarded staged job {jid}"
-                        if self.edit_mode_active and self.edit_job is not None:
-                            if self.edit_job.get("id") == jid:
-                                self.edit_mode_active = False
-                                self.edit_job = None
+                if self.queue_service.cancel_staged(jid):
+                    msg = f"Discarded staged job {jid}"
+                    if self.edit_mode_active and self.edit_job is not None:
+                        if self.edit_job.get("id") == jid:
+                            self.edit_mode_active = False
+                            self.edit_job = None
 
             elif action in ["move_pending_up", "move_pending_down"]:
                 offset = -1 if action == "move_pending_up" else 1
                 new_idx = None
                 queue_snapshot = None
-                with locked_queue() as q:
-                    if move_pending_job(q, jid, offset):
-                        msg = f"Moved {jid} {'up' if offset < 0 else 'down'}"
-                        for idx, job in enumerate(q["pending"]):
-                            if job.get("id") == jid:
-                                new_idx = idx
-                                break
-                        queue_snapshot = copy.deepcopy(q)
-                    else:
-                        msg = "Cannot move further"
+                if self.queue_service.move_pending(jid, offset):
+                    msg = f"Moved {jid} {'up' if offset < 0 else 'down'}"
+                    queue_snapshot = self.queue_service.snapshot()
+                    for idx, job in enumerate(queue_snapshot["pending"]):
+                        if job.get("id") == jid:
+                            new_idx = idx
+                            break
+                else:
+                    msg = "Cannot move further"
 
                 if queue_snapshot is not None:
                     with self.lock:

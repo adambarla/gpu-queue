@@ -43,8 +43,16 @@ class QueueService:
             "staged_at": now,
         }
 
+    def snapshot(self) -> dict[str, list[Job]]:
+        return self.store.load()
+
     def add_job(
-        self, command: str, gpus: int = 2, priority: str = "medium", front: bool = False
+        self,
+        command: str,
+        gpus: int = 2,
+        priority: str = "medium",
+        front: bool = False,
+        cwd: str | None = None,
     ) -> Job:
         priorities = {"low": 0, "medium": 1, "high": 2}
         prio = 3 if front else priorities.get(priority, 1)
@@ -55,6 +63,8 @@ class QueueService:
             "added": self._now(),
             "priority": prio,
         }
+        if cwd is not None:
+            job["cwd"] = cwd
 
         with self.store.transaction() as queue:
             if front:
@@ -113,6 +123,16 @@ class QueueService:
     def move_pending_to_staging(self, job_id: str) -> bool:
         with self.store.transaction() as queue:
             return move_pending_job_to_staging(queue, job_id)
+
+    def move_pending_to_staging_bulk(self, job_ids: Iterable[str]) -> list[str]:
+        requested = [str(job_id) for job_id in job_ids]
+        moved: list[str] = []
+        with self.store.transaction() as queue:
+            for job_id in reversed(requested):
+                if move_pending_job_to_staging(queue, job_id):
+                    moved.append(job_id)
+        moved_set = set(moved)
+        return [job_id for job_id in requested if job_id in moved_set]
 
     def cancel_staged(self, job_id: str) -> bool:
         with self.store.transaction() as queue:

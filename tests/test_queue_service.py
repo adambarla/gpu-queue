@@ -45,9 +45,10 @@ class QueueServiceTest(unittest.TestCase):
         service, store = self.service()
 
         service.add_job("first", gpus=2, priority="low")
-        front_job = service.add_job("urgent", gpus=1, front=True)
+        front_job = service.add_job("urgent", gpus=1, front=True, cwd="/work")
 
         self.assertEqual(front_job["priority"], 3)
+        self.assertEqual(front_job["cwd"], "/work")
         self.assertEqual(
             [job["cmd"] for job in store.queue["pending"]], ["urgent", "first"]
         )
@@ -127,3 +128,24 @@ class QueueServiceTest(unittest.TestCase):
         self.assertEqual(
             [job["id"] for job in store.queue["pending"]], ["p0", "p3", "p1", "p2"]
         )
+
+    def test_bulk_move_pending_to_staging_preserves_display_order(self):
+        service, store = self.service(
+            {
+                "staging": [],
+                "pending": [
+                    {"id": "p0"},
+                    {"id": "p1"},
+                    {"id": "p2"},
+                    {"id": "p3"},
+                ],
+                "running": [],
+                "completed": [],
+            }
+        )
+
+        moved = service.move_pending_to_staging_bulk(["p1", "p2"])
+
+        self.assertEqual(moved, ["p1", "p2"])
+        self.assertEqual([job["id"] for job in store.queue["pending"]], ["p0", "p3"])
+        self.assertEqual([job["id"] for job in store.queue["staging"]], ["p1", "p2"])
