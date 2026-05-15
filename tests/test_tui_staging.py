@@ -61,6 +61,12 @@ class TuiStagingTest(unittest.TestCase):
                 return i
         raise AssertionError("pending window not found")
 
+    def completed_idx(self, tui: mod.GPUQueueTUI) -> int:
+        for i, win in enumerate(tui.windows):
+            if win.key == "completed":
+                return i
+        raise AssertionError("completed window not found")
+
     def test_prompt_new_job_inserts_on_top(self):
         tui = self.load_tui(
             {
@@ -133,11 +139,57 @@ class TuiStagingTest(unittest.TestCase):
         tui.windows[completed_idx].selected_idx = 0
 
         tui.do_action("retry")
+        self.assertEqual(tui.modal["type"], "CONFIRM")
+        self.assertIn("old logs", tui.modal["text"])
+        tui.modal["on_confirm"]()
 
         data = mod.load_queue_raw()
         self.assertEqual(data["completed"], [])
         self.assertEqual(data["staging"][0]["cmd"], "python eval.py")
         self.assertNotEqual(data["staging"][0]["id"], "c1")
+
+    def test_duplicate_does_not_enter_edit_mode(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1", cmd="python train.py", gpus=2)],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        tui.active_win_idx = pending_idx
+        tui.windows[pending_idx].selected_idx = 0
+
+        tui.do_action("dup")
+
+        data = mod.load_queue_raw()
+        self.assertEqual(len(data["staging"]), 1)
+        self.assertEqual(data["staging"][0]["cmd"], "python train.py")
+        self.assertEqual(data["staging"][0]["gpus"], 2)
+        self.assertFalse(tui.edit_mode_active)
+        self.assertIsNone(tui.edit_job)
+
+    def test_duplicate_keeps_current_window_and_cursor(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1"), _job("p2"), _job("p3")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        win.selected_idx = 1
+        win.scroll_offset = 1
+
+        tui.do_action("dup")
+
+        self.assertEqual(tui.active_win_idx, pending_idx)
+        self.assertEqual(win.selected_idx, 1)
+        self.assertEqual(win.scroll_offset, 1)
 
     def test_send_staged_job_to_pending_requires_confirmation(self):
         tui = self.load_tui(
@@ -222,6 +274,229 @@ class TuiStagingTest(unittest.TestCase):
         self.assertEqual([j["id"] for j in data["pending"]], ["p1", "p3", "p4", "p2"])
         self.assertEqual(tui.windows[pending_idx].selected_idx, 3)
 
+    def test_select_mode_selects_rows_while_moving(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1"), _job("p2"), _job("p3")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        win.selected_idx = 0
+
+        tui._enter_select_mode(win)
+        tui._select_mode_move(win, 1)
+        tui._select_mode_move(win, 1)
+
+        self.assertTrue(tui.select_mode_active)
+        self.assertEqual(win.selected_idx, 2)
+        self.assertEqual(tui._selected_ids_for_window(win), ["p1", "p2", "p3"])
+
+        tui._exit_select_mode()
+        self.assertFalse(tui.select_mode_active)
+        self.assertEqual(tui._selected_ids_for_window(win), ["p1", "p2", "p3"])
+
+    def test_select_mode_move_up_deselects_rows(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1"), _job("p2"), _job("p3"), _job("p4")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        win.selected_idx = 0
+
+        tui._enter_select_mode(win)
+        tui._select_mode_move(win, 1)
+        tui._select_mode_move(win, 1)
+        self.assertEqual(tui._selected_ids_for_window(win), ["p1", "p2", "p3"])
+
+        tui._select_mode_move(win, -1)
+        self.assertEqual(win.selected_idx, 1)
+        self.assertEqual(tui._selected_ids_for_window(win), ["p1", "p2"])
+
+    def test_escape_clears_select_mode_selection(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1"), _job("p2")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        win.selected_idx = 0
+
+        tui._enter_select_mode(win)
+        tui._select_mode_move(win, 1)
+        tui._cancel_select_mode()
+
+        self.assertFalse(tui.select_mode_active)
+        self.assertEqual(tui._selected_ids_for_window(win), [])
+
+    def test_escape_clears_selection_even_after_leaving_select_mode(self):
+        tui = self.load_tui(
+            {
+                "staging": [_job("s1")],
+                "pending": [_job("p1")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        tui._enter_select_mode(win)
+        tui._exit_select_mode()
+        tui.selected_job_ids["staging"] = {"s1"}
+
+        tui._cancel_select_mode()
+
+        self.assertFalse(tui.select_mode_active)
+        self.assertEqual(tui.selected_job_ids["pending"], set())
+        self.assertEqual(tui.selected_job_ids["staging"], set())
+
+    def test_bulk_cancel_pending_uses_selected_rows(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1"), _job("p2"), _job("p3")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        tui.active_win_idx = pending_idx
+        tui.selected_job_ids["pending"] = {"p1", "p3"}
+
+        tui.do_action("cancel")
+        self.assertEqual(tui.modal["type"], "CONFIRM")
+        tui.modal["on_confirm"]()
+
+        data = mod.load_queue_raw()
+        self.assertEqual([j["id"] for j in data["pending"]], ["p2"])
+        self.assertEqual([j["id"] for j in data["completed"]], ["p3", "p1"])
+        self.assertEqual(tui.selected_job_ids["pending"], set())
+
+    def test_move_pending_job_back_to_staging_top(self):
+        tui = self.load_tui(
+            {
+                "staging": [_job("s1")],
+                "pending": [_job("p1"), _job("p2")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        win.selected_idx = 1
+
+        tui.do_action("back_to_staging")
+
+        data = mod.load_queue_raw()
+        self.assertEqual([j["id"] for j in data["staging"]], ["p2", "s1"])
+        self.assertEqual([j["id"] for j in data["pending"]], ["p1"])
+        self.assertEqual(win.selected_idx, 0)
+
+    def test_bulk_move_pending_jobs_back_to_staging_preserves_order(self):
+        tui = self.load_tui(
+            {
+                "staging": [_job("s1")],
+                "pending": [_job("p1"), _job("p2"), _job("p3"), _job("p4")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        tui.active_win_idx = pending_idx
+        tui.selected_job_ids["pending"] = {"p2", "p4"}
+
+        tui.do_action("back_to_staging")
+
+        data = mod.load_queue_raw()
+        self.assertEqual([j["id"] for j in data["staging"]], ["p2", "p4", "s1"])
+        self.assertEqual([j["id"] for j in data["pending"]], ["p1", "p3"])
+        self.assertEqual(tui.selected_job_ids["pending"], set())
+
+    def test_bulk_send_staged_jobs_to_pending(self):
+        tui = self.load_tui(
+            {
+                "staging": [_job("s1"), _job("s2"), _job("s3")],
+                "pending": [_job("p1")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        staging_idx = self.staging_idx(tui)
+        tui.active_win_idx = staging_idx
+        tui.selected_job_ids["staging"] = {"s1", "s3"}
+
+        tui.do_action("send_to_pending")
+        tui.modal["on_confirm"]()
+
+        data = mod.load_queue_raw()
+        self.assertEqual([j["id"] for j in data["staging"]], ["s2"])
+        self.assertEqual([j["id"] for j in data["pending"]], ["p1", "s1", "s3"])
+
+    def test_bulk_retry_completed_jobs_to_staging(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [],
+                "running": [],
+                "completed": [
+                    _job("c1", cmd="python a.py", status="failed"),
+                    _job("c2", cmd="python b.py", status="failed"),
+                ],
+            }
+        )
+        completed_idx = self.completed_idx(tui)
+        tui.active_win_idx = completed_idx
+        tui.selected_job_ids["completed"] = {"c1", "c2"}
+
+        tui.do_action("retry")
+        self.assertEqual(tui.modal["type"], "CONFIRM")
+        tui.modal["on_confirm"]()
+
+        data = mod.load_queue_raw()
+        self.assertEqual(data["completed"], [])
+        self.assertEqual(
+            [j["cmd"] for j in data["staging"]],
+            ["python b.py", "python a.py"],
+        )
+
+    def test_reorder_moves_bulk_selection_when_present(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1"), _job("p2"), _job("p3")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        win = tui.windows[pending_idx]
+        tui.active_win_idx = pending_idx
+        win.selected_idx = 1
+        tui.selected_job_ids["pending"] = {"p2", "p3"}
+
+        tui.do_action("move_pending_up")
+
+        data = mod.load_queue_raw()
+        self.assertEqual([j["id"] for j in data["pending"]], ["p2", "p3", "p1"])
+        self.assertEqual(win.selected_idx, 0)
+
     def test_scroll_offset_clamps_to_viewport_after_height_change(self):
         win = mod.Window("PENDING", "pending")
         win.height = 5
@@ -234,7 +509,7 @@ class TuiStagingTest(unittest.TestCase):
         self.assertEqual(win.scroll_offset, 0)
         self.assertEqual(win.selected_idx, 4)
 
-    def test_selected_job_panel_renders_current_job_in_nav_mode(self):
+    def test_selected_job_panel_renders_current_job_in_action_mode(self):
         tui = self.load_tui(
             {
                 "staging": [],
@@ -245,8 +520,7 @@ class TuiStagingTest(unittest.TestCase):
         )
         pending_idx = self.pending_idx(tui)
         tui.active_win_idx = pending_idx
-        tui.mode = "NAV"
-        tui.has_selected_job_context = True
+        tui._enter_action_window(tui.windows[pending_idx])
         screen = FakeScreen(10, 80)
         tui.stdscr = screen
 
@@ -255,6 +529,32 @@ class TuiStagingTest(unittest.TestCase):
         text = screen.text()
         self.assertIn("ID: p1", text)
         self.assertIn("python train.py", text)
+
+    def test_selected_job_panel_clears_after_exiting_action_window(self):
+        tui = self.load_tui(
+            {
+                "staging": [],
+                "pending": [_job("p1", cmd="python train.py")],
+                "running": [],
+                "completed": [],
+            }
+        )
+        pending_idx = self.pending_idx(tui)
+        tui.active_win_idx = pending_idx
+        tui._enter_action_window(tui.windows[pending_idx])
+        screen = FakeScreen(10, 80)
+        tui.stdscr = screen
+
+        tui.draw_job_details(1, 0, 6, 80)
+        self.assertIn("ID: p1", screen.text())
+
+        screen.calls = []
+        tui._exit_action_window(tui.windows[pending_idx])
+        tui.draw_job_details(1, 0, 6, 80)
+
+        text = screen.text()
+        self.assertIn("No job selected.", text)
+        self.assertNotIn("ID: p1", text)
 
     def test_selected_job_panel_is_empty_until_a_panel_is_entered(self):
         tui = self.load_tui(
@@ -306,7 +606,6 @@ class TuiStagingTest(unittest.TestCase):
             tui.draw()
 
         self.assertEqual(tui.stdscr.errors, [])
-
 
 class FakeScreen:
     def __init__(self, height: int, width: int):

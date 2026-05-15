@@ -30,7 +30,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional, Sequence, cast
 
 from gpu_queue.queue_state import (
     cancel_staged_job,
@@ -39,6 +39,8 @@ from gpu_queue.queue_state import (
     load_queue_file,
     make_staged_job,
     move_pending_job,
+    move_pending_jobs,
+    move_pending_job_to_staging,
     save_queue_file,
     send_staged_job_to_pending,
     stage_completed_retry,
@@ -58,7 +60,7 @@ DAEMON_LOG = QUEUE_DIR / "daemon.log"
 LOG_DIR = QUEUE_DIR / "logs"
 
 POLL_INTERVAL = 2  # seconds between GPU checks
-MIN_FREE_GPUS = 2  # Number of GPUs to always keep free for other users
+MIN_FREE_GPUS = 2  # Number of physically idle GPUs to always keep free
 SERVER_PORT = 12345
 
 CMD_FIELD_GHOST = "<press enter to edit command>"
@@ -361,7 +363,14 @@ def run_job(job: dict, gpu_indices: list[int]) -> int:
     return proc.pid
 
 
-def daemon_loop(min_free, excluded_gpus=None):
+def _running_gpu_usage(job: dict) -> int:
+    assigned = job.get("assigned_gpus", [])
+    if assigned:
+        return len(assigned)
+    return int(job.get("gpus", 1))
+
+
+def daemon_loop(min_free, excluded_gpus=None, max_use: Optional[int] = None):
     """Main scheduler loop."""
     if excluded_gpus is None:
         excluded_gpus = set()
@@ -378,30 +387,32 @@ def daemon_loop(min_free, excluded_gpus=None):
                     # Filter out excluded GPUs
                     gpus = [g for g in all_gpus if g["index"] not in excluded_gpus]
 
-                    total_gpus = len(gpus)
-
-                    # Excluded GPUs count towards the reserved quota
-                    effective_min_free = max(0, min_free - len(excluded_gpus))
-
-                    quota = total_gpus - effective_min_free
-
-                    # Count GPUs currently assigned to our running jobs
-                    our_usage = sum(job.get("gpus", 1) for job in queue["running"])
-                    quota_remaining = quota - our_usage
-
-                    # List of GPUs that are ACTUALLY free
                     our_assigned = set()
+                    our_usage = 0
                     for j in queue["running"]:
+                        our_usage += _running_gpu_usage(j)
                         for idx in j.get("assigned_gpus", []):
                             our_assigned.add(idx)
 
+                    actual_free_count = sum(
+                        1
+                        for g in all_gpus
+                        if g["free"] and g["index"] not in our_assigned
+                    )
+                    startable_gpus = max(0, actual_free_count - min_free)
+                    if max_use is not None:
+                        startable_gpus = min(
+                            startable_gpus, max(0, max_use - our_usage)
+                        )
+
+                    # List of GPUs we may assign while preserving actual idle reserve.
                     free_indices = [
                         g["index"]
                         for g in gpus
                         if g["free"] and g["index"] not in our_assigned
                     ]
 
-                    if quota_remaining > 0:
+                    if startable_gpus > 0:
                         # --- Backfilling Scheduler ---
                         jobs_started = False
                         remaining_pending = []
@@ -409,7 +420,7 @@ def daemon_loop(min_free, excluded_gpus=None):
                         for job in queue["pending"]:
                             req = job.get("gpus", 1)
 
-                            if req <= quota_remaining and req <= len(free_indices):
+                            if req <= startable_gpus and req <= len(free_indices):
                                 assigned = free_indices[:req]
                                 log_msg(f"Starting job {job['id']} on GPUs {assigned}")
 
@@ -421,7 +432,7 @@ def daemon_loop(min_free, excluded_gpus=None):
                                 job["started"] = datetime.now().isoformat()
                                 queue["running"].append(job)
 
-                                quota_remaining -= req
+                                startable_gpus -= req
                                 free_indices = free_indices[req:]
                                 jobs_started = True
                             else:
@@ -436,6 +447,7 @@ def daemon_loop(min_free, excluded_gpus=None):
                             "ts": datetime.now().isoformat(),
                             "gpus": all_gpus,
                             "min_free": min_free,
+                            "max_use": max_use,
                             "excluded": list(excluded_gpus),
                         }
                         (QUEUE_DIR / "status.json").write_text(json.dumps(status_data))
@@ -448,6 +460,7 @@ def daemon_loop(min_free, excluded_gpus=None):
                             "ts": datetime.now().isoformat(),
                             "gpus": all_gpus,
                             "min_free": min_free,
+                            "max_use": max_use,
                             "excluded": list(excluded_gpus),
                         }
                         (QUEUE_DIR / "status.json").write_text(json.dumps(status_data))
@@ -466,7 +479,10 @@ def daemon_loop(min_free, excluded_gpus=None):
 def cmd_serve(args):
     """Run the scheduler loop in the foreground."""
     ensure_dirs()
-    print(f"✓ Scheduler started (keeping {args.min_free} GPUs reserved)")
+    max_use = getattr(args, "max_use", None)
+    print(f"✓ Scheduler started (keeping {args.min_free} GPUs physically idle)")
+    if max_use is not None:
+        print(f"  Max gpu-queue use: {max_use} GPUs")
     print(f"  Polling every {POLL_INTERVAL}s")
 
     # Parse excluded GPUs
@@ -480,7 +496,7 @@ def cmd_serve(args):
             print("Error: Invalid format for --exclude-gpus.")
             sys.exit(1)
 
-    daemon_loop(args.min_free, excluded)
+    daemon_loop(args.min_free, excluded, max_use=max_use)
 
 
 def log_msg(msg: str, verbose: bool = False):
@@ -524,6 +540,7 @@ def cmd_add(args):
 def cmd_start(args):
     """Start the daemon."""
     ensure_dirs()
+    max_use = getattr(args, "max_use", None)
 
     if is_daemon_running():
         print("Daemon is already running!")
@@ -546,7 +563,9 @@ def cmd_start(args):
     PID_FILE.write_text(str(os.getpid()))
 
     # Store config in separate file or just run with args
-    (QUEUE_DIR / "config.json").write_text(json.dumps({"min_free_gpus": args.min_free}))
+    (QUEUE_DIR / "config.json").write_text(
+        json.dumps({"min_free_gpus": args.min_free, "max_use_gpus": max_use})
+    )
 
     # Redirect stdout/stderr
     sys.stdout = open(DAEMON_LOG, "a")
@@ -561,7 +580,7 @@ def cmd_start(args):
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    daemon_loop(args.min_free)
+    daemon_loop(args.min_free, max_use=max_use)
 
 
 def cmd_stop(args):
@@ -800,14 +819,16 @@ def get_status_data():
     queue = load_queue()
     gpus = get_free_gpus()
 
-    # Get config (min_free and excluded)
+    # Get config (min_free, max_use, and excluded)
     min_free = 2
+    max_use = None
     excluded = set()
     config_file = QUEUE_DIR / "config.json"
     if config_file.exists():
         try:
             cfg = json.loads(config_file.read_text())
             min_free = cfg.get("min_free_gpus", 2)
+            max_use = cfg.get("max_use_gpus")
             excluded = set(cfg.get("excluded_gpus", []))
         except Exception:
             pass
@@ -819,6 +840,7 @@ def get_status_data():
         "queue": queue,
         "gpus": gpus,
         "min_free": min_free,
+        "max_use": max_use,
         "excluded": list(excluded),
         "term_width": get_terminal_width(),
     }
@@ -904,6 +926,7 @@ class GPUQueueTUI:
         self.data = {"staging": [], "running": [], "pending": [], "completed": []}
         self.gpu_status = []
         self.min_free = 2
+        self.max_use: Optional[int] = None
         self.excluded = []
         self.server_status = "UNKNOWN"
         self.last_updated = 0
@@ -927,6 +950,15 @@ class GPUQueueTUI:
         self.active_win_idx = 0  # Index in self.windows
         self.mode = "NAV"  # "NAV" (select window) or "ACTION" (interact with window)
         self.has_selected_job_context = False
+        self.selected_job_ids: dict[str, set[str]] = {
+            "running": set(),
+            "pending": set(),
+            "staging": set(),
+            "completed": set(),
+        }
+        self.select_mode_active = False
+        self.select_mode_window_key: Optional[str] = None
+        self.select_mode_anchor_idx: Optional[int] = None
 
         # Log view state
         self.viewing_logs = False
@@ -1026,6 +1058,9 @@ class GPUQueueTUI:
             for item in items:
                 item["_type"] = type_label
             w.update_items(items)
+            if w.key in self.selected_job_ids:
+                live_ids = {str(item.get("id")) for item in items}
+                self.selected_job_ids[w.key].intersection_update(live_ids)
 
         if self.edit_mode_active and self.edit_job is not None:
             edit_id = self.edit_job.get("id")
@@ -1043,11 +1078,108 @@ class GPUQueueTUI:
             return win.get_selected()
         return getattr(self, "last_selected_job", None)
 
+    def _selected_ids_for_window(self, win) -> list[str]:
+        """Return checked row IDs in display order for a queue window."""
+        selected = self.selected_job_ids.get(win.key, set())
+        if not selected:
+            return []
+        return [
+            str(item["id"])
+            for item in win.items
+            if item.get("id") is not None and str(item["id"]) in selected
+        ]
+
+    def _action_ids_for_window(self, win) -> list[str]:
+        checked = self._selected_ids_for_window(win)
+        if checked:
+            return checked
+        job = win.get_selected()
+        if not job:
+            return []
+        return [str(job["id"])]
+
+    def _select_current_row(self, win) -> None:
+        if win.key not in self.selected_job_ids:
+            return
+        job = win.get_selected()
+        if not job:
+            return
+        self.selected_job_ids[win.key].add(str(job["id"]))
+
+    def _select_range_to_cursor(self, win) -> None:
+        if win.key not in self.selected_job_ids or not win.items:
+            return
+        if self.select_mode_anchor_idx is None:
+            self.select_mode_anchor_idx = win.selected_idx
+        anchor = max(0, min(len(win.items) - 1, self.select_mode_anchor_idx))
+        cursor = max(0, min(len(win.items) - 1, win.selected_idx))
+        lo = min(anchor, cursor)
+        hi = max(anchor, cursor)
+        self.selected_job_ids[win.key] = {
+            str(win.items[idx]["id"]) for idx in range(lo, hi + 1)
+        }
+
+    def _enter_select_mode(self, win) -> None:
+        if win.key not in self.selected_job_ids or not win.get_selected():
+            return
+        self.selected_job_ids[win.key] = set()
+        self.select_mode_active = True
+        self.select_mode_window_key = win.key
+        self.select_mode_anchor_idx = win.selected_idx
+        self._select_range_to_cursor(win)
+        self.action_msg = "Select mode"
+        self.msg_clear_time = time.time() + 2.0
+
+    def _exit_select_mode(self) -> None:
+        self.select_mode_active = False
+        self.select_mode_window_key = None
+        self.select_mode_anchor_idx = None
+
+    def _has_selected_ids(self) -> bool:
+        return any(self.selected_job_ids.values())
+
+    def _clear_all_selected_ids(self) -> None:
+        for key in self.selected_job_ids:
+            self.selected_job_ids[key].clear()
+
+    def _cancel_select_mode(self) -> None:
+        self._clear_all_selected_ids()
+        self._exit_select_mode()
+
+    def _select_mode_move(self, win, delta: int, h: Optional[int] = None) -> None:
+        if not self.select_mode_active or self.select_mode_window_key != win.key:
+            return
+        previous_idx = win.selected_idx
+        win.scroll(delta, h)
+        if win.selected_idx == previous_idx:
+            return
+        self._select_range_to_cursor(win)
+        selected_count = len(self._selected_ids_for_window(win))
+        self.action_msg = f"Selected {selected_count} jobs"
+        self.msg_clear_time = time.time() + 2.0
+
+    def _clear_selected_ids(self, jids: Sequence[str]) -> None:
+        ids = {str(jid) for jid in jids}
+        for selected in self.selected_job_ids.values():
+            selected.difference_update(ids)
+        if (
+            self.select_mode_window_key is not None
+            and not self.selected_job_ids.get(self.select_mode_window_key)
+        ):
+            self._exit_select_mode()
+
     def _enter_action_window(self, win):
         self.mode = "ACTION"
         win.collapsed = False
         if win.key in ["running", "pending", "staging", "completed"]:
             self.has_selected_job_context = True
+
+    def _exit_action_window(self, win):
+        self.mode = "NAV"
+        self.has_selected_job_context = False
+        self.last_selected_job = None
+        win.scroll_offset = 0
+        win.selected_idx = 0
 
     def start(self):
         self.running = True
@@ -1104,6 +1236,7 @@ class GPUQueueTUI:
                             with self.lock:
                                 self.gpu_status = s.get("gpus", [])
                                 self.min_free = s.get("min_free", 2)
+                                self.max_use = s.get("max_use")
                                 self.excluded = s.get("excluded", [])
                                 self.server_status = "DAEMON: ON"
                                 self._append_gpu_util_sample(s)
@@ -1342,6 +1475,8 @@ class GPUQueueTUI:
 
             # Daemon Info (Reserved/Excluded)
             info_str = f"Res: {self.min_free}"
+            if self.max_use is not None:
+                info_str += f" | Max: {self.max_use}"
             if self.excluded:
                 ex_list = ",".join(map(str, sorted(self.excluded)))
                 info_str += f" | Excl: [{ex_list}]"
@@ -1608,7 +1743,7 @@ class GPUQueueTUI:
             left = x + 2
             inner = max(0, w - 4)
             prefix_w, hist_w, proc_w = _gpu_status_column_widths(inner)
-            hdr_attr = curses.A_NORMAL | curses.A_UNDERLINE
+            hdr_attr = curses.A_BOLD
             row_attr = curses.A_NORMAL
 
             if not self.gpu_status:
@@ -1758,8 +1893,8 @@ class GPUQueueTUI:
                 title_color = curses.color_pair(5) | curses.A_BOLD  # Blue bold
                 draw_border = True
             elif active:
-                border_color = curses.color_pair(6)  # White
-                title_color = curses.color_pair(6) | curses.A_BOLD  # White bold
+                border_color = curses.A_NORMAL
+                title_color = curses.A_BOLD
                 draw_border = True
             else:
                 # Unselected: don't draw border; title should use normal text.
@@ -1783,7 +1918,11 @@ class GPUQueueTUI:
             # Title
             count_str = ""
             if win.key in ["running", "staging", "pending", "completed"]:
-                count_str = f"[{len(win.items)}]"
+                selected_count = len(self._selected_ids_for_window(win))
+                count_str = f"[{len(win.items)}"
+                if selected_count:
+                    count_str += f"/{selected_count}"
+                count_str += "]"
 
             title_s = f" {win.title} {count_str} "
             if win.collapsed:
@@ -1836,9 +1975,6 @@ class GPUQueueTUI:
                     f"{'AGO':<{cw['ago']}} CMD"
                 )
 
-            if hdr:
-                self.stdscr.addstr(y + 1, 1, hdr, curses.A_NORMAL | curses.A_UNDERLINE)
-
             # List items
             display_items = list(win.items)
 
@@ -1862,6 +1998,17 @@ class GPUQueueTUI:
                 return
 
             start_y = y + 1 + header_offset
+            has_scrollbar = len(display_items) > list_h
+            row_text_w = max(0, w - (4 if has_scrollbar else 3))
+            scrollbar_x = max(x + 1, x + w - 2)
+
+            if hdr:
+                self.stdscr.addstr(
+                    y + 1,
+                    x + 1,
+                    _fit_text_field(hdr, row_text_w),
+                    curses.A_BOLD,
+                )
 
             # We need to handle scroll offset carefully if we injected an item
             # If we injected, the list is 1 longer.
@@ -1877,21 +2024,36 @@ class GPUQueueTUI:
                     if abs_idx == win.selected_idx:
                         is_sel = True
 
-                line_res, line_col = self.format_job_line(item, w - 2)
+                line_res, line_col = self.format_job_line(item, row_text_w)
 
                 draw_style = curses.A_NORMAL
+                is_bulk_selected = (
+                    win.key in self.selected_job_ids
+                    and str(item.get("id")) in self.selected_job_ids[win.key]
+                )
+                if is_bulk_selected:
+                    draw_style |= curses.A_REVERSE | curses.A_BOLD
                 if is_sel:
                     if focused:
-                        draw_style = curses.A_REVERSE
+                        draw_style |= curses.A_REVERSE
                     else:
                         # In NAV mode, pass or different style
                         pass
+
+                try:
+                    self.stdscr.addstr(
+                        start_y + i, x + 1, " " * row_text_w, curses.A_NORMAL
+                    )
+                except Exception:
+                    pass
 
                 # Handle Rich Text (Dictionary)
                 if isinstance(line_res, dict) and line_res.get("type") == "rich":
                     current_x = 1
                     segments = line_res["segments"]
                     base_attr = line_res.get("base_color", curses.A_NORMAL)
+                    if is_bulk_selected:
+                        base_attr |= curses.A_REVERSE | curses.A_BOLD
 
                     # Clear line with base attr first?
                     # self.stdscr.addstr(start_y + i, 1, " " * (w-2), base_attr)
@@ -1899,13 +2061,15 @@ class GPUQueueTUI:
                     for text, attr in segments:
                         try:
                             self.stdscr.addstr(
-                                start_y + i, current_x, text, attr | base_attr
+                                start_y + i, x + current_x, text, attr | base_attr
                             )
                             current_x += len(text)
                         except Exception:
                             pass
                 else:
-                    self.stdscr.addstr(start_y + i, 1, line_res, line_col | draw_style)
+                    self.stdscr.addstr(
+                        start_y + i, x + 1, line_res, line_col | draw_style
+                    )
 
             # Scroll bar indicator?
             if len(display_items) > list_h:
@@ -1916,7 +2080,9 @@ class GPUQueueTUI:
                     if k >= sb_pos and k < sb_pos + sb_h:
                         char = "█"
                     try:
-                        self.stdscr.addstr(start_y + k, w - 1, char, curses.A_NORMAL)
+                        self.stdscr.addstr(
+                            start_y + k, scrollbar_x, char, curses.A_NORMAL
+                        )
                     except Exception:
                         pass
         except Exception:
@@ -1940,14 +2106,16 @@ class GPUQueueTUI:
             else:
                 # Context-aware help based on active window
                 win = self.windows[self.active_win_idx]
-                if win.key == "staging":
-                    help_str += "h:Back  c:Discard  e:Edit  s:Send  d:Dup  n:New"
+                if self.select_mode_active and self.select_mode_window_key == win.key:
+                    help_str += "j/k:Extend Selection  v:Done  Esc:Cancel"
+                elif win.key == "staging":
+                    help_str += "h:Back  v:Select  c:Discard  e:Edit  s:Send  d:Dup"
                 elif win.key == "pending":
-                    help_str += "h:Back  c:Cancel  J/K:Reorder  Space:Log"
+                    help_str += "h:Back  v:Select  b:Stage  c:Cancel  J/K:Reorder  Space:Log"
                 elif win.key == "running":
-                    help_str += "h:Back  Space:Log  c:Cancel  p:Pause  d:Dup"
+                    help_str += "h:Back  v:Select  Space:Log  c:Cancel  p:Pause  d:Dup"
                 elif win.key == "completed":
-                    help_str += "h:Back  Space:Log  r:Stage Retry  x:Delete  d:Dup"
+                    help_str += "h:Back  v:Select  Space:Log  r:Retry  x:Delete  d:Dup"
                 else:
                     help_str += "h:Back  Space:Log  d:Dup  n:New"
 
@@ -1955,11 +2123,17 @@ class GPUQueueTUI:
             mode_label = self.mode
             if self.edit_mode_active:
                 mode_label = "EDIT"
+            elif self.select_mode_active:
+                mode_label = "SELECT"
 
             mode_s = f" MODE: {mode_label} "
-            padding = " " * (w - len(help_str) - len(mode_s))
+            if len(mode_s) >= w:
+                full_str = _fit_text_field(mode_s, w)
+            else:
+                help_str = _fit_text_field(help_str, w - len(mode_s)).rstrip()
+                padding = " " * max(0, w - len(help_str) - len(mode_s))
+                full_str = help_str + padding + mode_s
 
-            full_str = help_str + padding + mode_s
             # Blue background (Pair 5)
             self.stdscr.addstr(y, 0, full_str, curses.color_pair(5) | curses.A_REVERSE)
         except Exception:
@@ -2116,6 +2290,8 @@ class GPUQueueTUI:
                         elif ch == ord("n") or ch == 27:  # No / Esc
                             if m["on_cancel"]:
                                 m["on_cancel"]()
+                            if ch == 27 and self._has_selected_ids():
+                                self._cancel_select_mode()
                             self.modal = None
 
                     elif m["type"] == "INPUT":
@@ -2248,17 +2424,31 @@ class GPUQueueTUI:
 
                 elif self.mode == "ACTION":
                     win = self.windows[self.active_win_idx]
-                    h = (self.stdscr.getmaxyx()[0] - 5) // 3  # approx height per window
+                    window_h = getattr(win, "height", None)
 
                     if ch == ord("h") or ch == 27:  # h or Esc
-                        self.mode = "NAV"
-                        # Reset scroll to top
-                        win.scroll_offset = 0
-                        win.selected_idx = 0
+                        if self.select_mode_active:
+                            self._cancel_select_mode()
+                            continue
+                        if ch == 27 and self._has_selected_ids():
+                            self._cancel_select_mode()
+                            continue
+                        self._exit_action_window(win)
                     elif ch == ord("k"):
-                        win.scroll(-1, h)
+                        if self.select_mode_active:
+                            self._select_mode_move(win, -1, window_h)
+                        else:
+                            win.scroll(-1, window_h)
                     elif ch == ord("j"):
-                        win.scroll(1, h)
+                        if self.select_mode_active:
+                            self._select_mode_move(win, 1, window_h)
+                        else:
+                            win.scroll(1, window_h)
+                    elif ch == ord("v"):
+                        if self.select_mode_active:
+                            self._exit_select_mode()
+                        else:
+                            self._enter_select_mode(win)
                     elif ch == ord(" "):
                         self.action_view_logs()
                     elif ch == ord("L"):
@@ -2287,6 +2477,9 @@ class GPUQueueTUI:
                     elif ch == ord("s"):  # Send staged job to pending
                         if win.key == "staging":
                             self.do_action("send_to_pending")
+                    elif ch == ord("b"):  # Move pending job back to staging
+                        if win.key == "pending":
+                            self.do_action("back_to_staging")
                     elif ch == ord("J"):  # Move pending job down
                         if win.key == "pending":
                             self.do_action("move_pending_down")
@@ -2397,10 +2590,30 @@ class GPUQueueTUI:
         """Perform action on selected job."""
         win = self.windows[self.active_win_idx]
         job = win.get_selected()
-        if not job:
+        cursor_only_actions = {"edit"}
+        focus_jid = str(job["id"]) if job else None
+        if action in cursor_only_actions:
+            if not job:
+                return
+            jids = [str(job["id"])]
+        elif action in {"move_pending_up", "move_pending_down"} and win.key == "pending":
+            selected = self._selected_ids_for_window(win)
+            if selected:
+                jids = selected
+                if focus_jid not in set(jids):
+                    focus_jid = jids[0]
+            else:
+                if not job:
+                    return
+                jids = [str(job["id"])]
+        else:
+            jids = self._action_ids_for_window(win)
+        if not jids:
             return
 
-        jid = job["id"] if job else ""
+        jid = jids[0]
+        count = len(jids)
+        target = f"{count} jobs" if count > 1 else f"job {jid}"
 
         # Actions that require modals
         if action == "cancel":
@@ -2410,8 +2623,10 @@ class GPUQueueTUI:
                 self.modal = {
                     "type": "CONFIRM",
                     "title": "Cancel Staged Job",
-                    "text": f"Cancel staged job {jid}?",
-                    "on_confirm": lambda: self.execute_action("cancel", jid),
+                    "text": f"Cancel staged {target}?",
+                    "on_confirm": lambda jids=jids: self.execute_bulk_action(
+                        "cancel", jids
+                    ),
                     "on_cancel": None,
                 }
                 return
@@ -2419,8 +2634,10 @@ class GPUQueueTUI:
             self.modal = {
                 "type": "CONFIRM",
                 "title": "Cancel Job",
-                "text": f"Cancel job {jid}?",
-                "on_confirm": lambda: self.execute_action("cancel", jid),
+                "text": f"Cancel {target}?",
+                "on_confirm": lambda jids=jids: self.execute_bulk_action(
+                    "cancel", jids
+                ),
                 "on_cancel": None,
             }
             return
@@ -2430,14 +2647,18 @@ class GPUQueueTUI:
             self.modal = {
                 "type": "CONFIRM",
                 "title": "Delete Job",
-                "text": f"Permanently delete {jid}?",
-                "on_confirm": lambda: self.execute_action("delete", jid),
+                "text": f"Permanently delete {target}?",
+                "on_confirm": lambda jids=jids: self.execute_bulk_action(
+                    "delete", jids
+                ),
                 "on_cancel": None,
             }
             return
 
         elif action == "edit":
             # Edit only works for staging (already checked in keybinding)
+            if not job:
+                return
             self.edit_job = copy.deepcopy(job)
             self.edit_job["_type"] = "staging"
             self.edit_is_new = False
@@ -2446,26 +2667,7 @@ class GPUQueueTUI:
             return
 
         elif action == "dup":
-            dup_job = make_staged_job(
-                generate_job_id(), job.get("cmd", ""), job.get("gpus", 1)
-            )
-            with locked_queue() as q:
-                insert_staged_job(q, dup_job)
-            self.edit_job = copy.deepcopy(dup_job)
-            self.edit_job["_type"] = "staging"
-            self.edit_is_new = True
-            self.edit_mode_active = True
-            self.edit_field_idx = 0
-
-            # Switch to STAGING window
-            for i, w in enumerate(self.windows):
-                if w.key == "staging":
-                    self.active_win_idx = i
-                    w.selected_idx = 0
-                    w.scroll_offset = 0
-                    self.has_selected_job_context = True
-                    break
-
+            self.execute_bulk_action("dup", jids)
             return
         elif action == "send_to_pending":
             if win.key != "staging":
@@ -2473,14 +2675,144 @@ class GPUQueueTUI:
             self.modal = {
                 "type": "CONFIRM",
                 "title": "Send To Pending",
-                "text": f"Send job {jid} to pending queue?",
-                "on_confirm": lambda: self.execute_action("send_to_pending", jid),
+                "text": f"Send {target} to pending queue?",
+                "on_confirm": lambda jids=jids: self.execute_bulk_action(
+                    "send_to_pending", jids
+                ),
+                "on_cancel": None,
+            }
+            return
+        elif action == "back_to_staging":
+            if win.key != "pending":
+                return
+            self.execute_bulk_action("back_to_staging", jids)
+            return
+        elif action == "retry":
+            if win.key != "completed":
+                return
+            self.modal = {
+                "type": "CONFIRM",
+                "title": "Retry Completed Job",
+                "text": (
+                    f"Retry {target}? This may replace or overwrite access to old logs."
+                ),
+                "on_confirm": lambda jids=jids: self.execute_bulk_action(
+                    "retry", jids
+                ),
                 "on_cancel": None,
             }
             return
 
         # Immediate actions
-        self.execute_action(action, jid)
+        self.execute_bulk_action(action, jids, focus_jid=focus_jid)
+
+    def execute_bulk_action(self, action, jids, **kwargs):
+        jids = list(dict.fromkeys(str(jid) for jid in jids))
+        if not jids:
+            return
+        if len(jids) == 1:
+            self.execute_action(action, jids[0], **kwargs)
+            return
+
+        if action in ["edit", "change_gpus"]:
+            self.action_msg = "Action only supports the cursor row"
+            self.msg_clear_time = time.time() + 2.0
+            return
+
+        if action in ["move_pending_up", "move_pending_down"]:
+            offset = -1 if action == "move_pending_up" else 1
+            focus_jid = str(kwargs.get("focus_jid")) if kwargs.get("focus_jid") else None
+            queue_snapshot = None
+            with locked_queue() as q:
+                if move_pending_jobs(q, jids, offset):
+                    queue_snapshot = copy.deepcopy(q)
+                else:
+                    self.action_msg = "Cannot move further"
+                    self.msg_clear_time = time.time() + 2.0
+                    return
+            if queue_snapshot is not None:
+                with self.lock:
+                    self._set_data_snapshot(queue_snapshot)
+                    for w in self.windows:
+                        if w.key != "pending":
+                            continue
+                        target_idx = None
+                        if focus_jid is not None:
+                            for idx, pending_job in enumerate(w.items):
+                                if str(pending_job.get("id")) == focus_jid:
+                                    target_idx = idx
+                                    break
+                        if target_idx is not None:
+                            w.selected_idx = target_idx
+                        w.ensure_selected_visible()
+                        break
+            direction = "up" if offset < 0 else "down"
+            self.action_msg = (
+                f"Moved {len(jids)} selected jobs {direction}"
+                if len(jids) > 1
+                else f"Moved {jids[0]} {direction}"
+            )
+            self.msg_clear_time = time.time() + 2.0
+            return
+
+        if action == "dup":
+            created = []
+            with locked_queue() as q:
+                jobs_by_id = {
+                    str(job.get("id")): job
+                    for key in ["running", "pending", "staging", "completed"]
+                    for job in q.get(key, [])
+                }
+                for jid in jids:
+                    job = jobs_by_id.get(jid)
+                    if job is None:
+                        continue
+                    dup_job = make_staged_job(
+                        generate_job_id(), job.get("cmd", ""), job.get("gpus", 1)
+                    )
+                    insert_staged_job(q, dup_job)
+                    created.append(dup_job["id"])
+            self.action_msg = f"Duplicated {len(created)} jobs"
+            self.msg_clear_time = time.time() + 2.0
+            return
+
+        if action == "back_to_staging":
+            moved = []
+            queue_snapshot = None
+            with locked_queue() as q:
+                for jid in reversed(jids):
+                    if move_pending_job_to_staging(q, jid):
+                        moved.append(jid)
+                if moved:
+                    queue_snapshot = copy.deepcopy(q)
+            if queue_snapshot is not None:
+                with self.lock:
+                    self._set_data_snapshot(queue_snapshot)
+            self._clear_selected_ids(jids)
+            self.action_msg = f"Moved {len(moved)} jobs to staging"
+            self.msg_clear_time = time.time() + 2.0
+            return
+
+        messages = []
+        for jid in jids:
+            self.execute_action(action, jid, **kwargs)
+            if self.action_msg:
+                messages.append(self.action_msg)
+
+        action_labels = {
+            "cancel": "Cancelled",
+            "delete": "Deleted",
+            "pause": "Paused",
+            "retry": "Staged retries for",
+            "dup": "Duplicated",
+            "send_to_pending": "Sent",
+            "back_to_staging": "Moved to staging",
+            "discard_staging": "Discarded",
+        }
+        label = action_labels.get(action, "Updated")
+        self.action_msg = f"{label} {len(messages) or len(jids)} jobs"
+        self._clear_selected_ids(jids)
+        self.msg_clear_time = time.time() + 2.0
 
     def execute_action(self, action, jid, **kwargs):
         # Re-use existing cmd functions if possible, or call logic directly
@@ -2540,6 +2872,21 @@ class GPUQueueTUI:
                 )
                 msg = f"Pausing {jid}..."
 
+            elif action == "dup":
+                with locked_queue() as q:
+                    jobs_by_id = {
+                        str(job.get("id")): job
+                        for key in ["running", "pending", "staging", "completed"]
+                        for job in q.get(key, [])
+                    }
+                    job = jobs_by_id.get(str(jid))
+                    if job is not None:
+                        dup_job = make_staged_job(
+                            generate_job_id(), job.get("cmd", ""), job.get("gpus", 1)
+                        )
+                        insert_staged_job(q, dup_job)
+                        msg = f"Duplicated {jid} to {dup_job['id']}"
+
             elif action == "retry":
                 with locked_queue() as q:
                     for job in q["completed"]:
@@ -2569,6 +2916,16 @@ class GPUQueueTUI:
                 with locked_queue() as q:
                     if send_staged_job_to_pending(q, jid):
                         msg = f"Sent {jid} to pending"
+
+            elif action == "back_to_staging":
+                queue_snapshot = None
+                with locked_queue() as q:
+                    if move_pending_job_to_staging(q, jid):
+                        msg = f"Moved {jid} to staging"
+                        queue_snapshot = copy.deepcopy(q)
+                if queue_snapshot is not None:
+                    with self.lock:
+                        self._set_data_snapshot(queue_snapshot)
 
             elif action == "discard_staging":
                 with locked_queue() as q:
@@ -2607,6 +2964,8 @@ class GPUQueueTUI:
         except Exception as e:
             msg = f"Err: {str(e)}"
 
+        if action not in ["dup", "move_pending_up", "move_pending_down", "update_staging"]:
+            self._clear_selected_ids([jid])
         self.action_msg = msg
         self.msg_clear_time = time.time() + 2.0
 
@@ -2653,7 +3012,16 @@ def main():
         "start", help="Start the queue scheduler (background)"
     )
     start_parser.add_argument(
-        "--min-free", type=int, default=2, help="Number of GPUs to always keep free"
+        "--min-free",
+        type=int,
+        default=2,
+        help="Number of physically idle GPUs to always keep free",
+    )
+    start_parser.add_argument(
+        "--max-use",
+        type=int,
+        default=None,
+        help="Maximum GPUs this queue may occupy at once",
     )
     start_parser.set_defaults(func=cmd_start)
 
@@ -2666,7 +3034,16 @@ def main():
         "serve", help="Run the queue scheduler (foreground)"
     )
     serve_parser.add_argument(
-        "--min-free", type=int, default=2, help="Number of GPUs to always keep free"
+        "--min-free",
+        type=int,
+        default=2,
+        help="Number of physically idle GPUs to always keep free",
+    )
+    serve_parser.add_argument(
+        "--max-use",
+        type=int,
+        default=None,
+        help="Maximum GPUs this queue may occupy at once",
     )
     serve_parser.add_argument(
         "--exclude-gpus",

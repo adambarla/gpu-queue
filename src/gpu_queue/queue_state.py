@@ -64,6 +64,18 @@ def send_staged_job_to_pending(queue: dict[str, list], job_id: str) -> bool:
     return False
 
 
+def move_pending_job_to_staging(queue: dict[str, list], job_id: str) -> bool:
+    for i, job in enumerate(queue["pending"]):
+        if job["id"] == job_id:
+            moved = queue["pending"].pop(i)
+            now = datetime.now().isoformat()
+            moved["added"] = now
+            moved["staged_at"] = now
+            queue["staging"].insert(0, moved)
+            return True
+    return False
+
+
 def cancel_staged_job(queue: dict[str, list], job_id: str) -> bool:
     for i, job in enumerate(queue["staging"]):
         if job["id"] == job_id:
@@ -97,4 +109,34 @@ def move_pending_job(queue: dict[str, list], job_id: str, offset: int) -> bool:
     if new_idx < 0 or new_idx >= len(pending):
         return False
     pending[idx], pending[new_idx] = pending[new_idx], pending[idx]
+    return True
+
+
+def move_pending_jobs(queue: dict[str, list], job_ids: list[str], offset: int) -> bool:
+    """Move multiple pending jobs together by one row, preserving relative order."""
+    if offset not in (-1, 1):
+        return False
+    pending = queue["pending"]
+    if not pending or not job_ids:
+        return False
+
+    wanted = {str(job_id) for job_id in job_ids}
+    indexed = [
+        i for i, job in enumerate(pending) if job.get("id") is not None and str(job.get("id")) in wanted
+    ]
+    if not indexed:
+        return False
+
+    if offset < 0 and indexed[0] == 0:
+        return False
+    if offset > 0 and indexed[-1] == len(pending) - 1:
+        return False
+
+    if offset < 0:
+        for idx in indexed:
+            pending[idx - 1], pending[idx] = pending[idx], pending[idx - 1]
+        return True
+
+    for idx in reversed(indexed):
+        pending[idx + 1], pending[idx] = pending[idx], pending[idx + 1]
     return True
