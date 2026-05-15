@@ -1,119 +1,129 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
 
+from gpu_queue.domain import GpuSnapshot
 from gpu_queue.storage import load_queue
 
 
-def get_free_gpus() -> list[dict[str, Any]]:
-    """Get list of GPUs with their status (free = no processes running)."""
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,memory.total,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        gpus = {}
-        for line in result.stdout.strip().split("\n"):
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 3:
-                idx = int(parts[0])
-                used = int(parts[1])
-                total = int(parts[2])
-                util = 0
-                if len(parts) >= 4 and parts[3].strip().isdigit():
-                    util = int(parts[3].strip())
+class NvidiaSmiGpuProvider:
+    def __init__(
+        self,
+        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        pid_exists: Callable[[int], bool] | None = None,
+    ) -> None:
+        self.run = run
+        self.pid_exists = pid_exists or (lambda pid: Path(f"/proc/{pid}").exists())
 
-                gpus[idx] = {
-                    "index": idx,
-                    "used_mb": used,
-                    "total_mb": total,
-                    "util": util,
-                    "free": True,
-                    "processes": [],
-                }
+    def _run(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return self.run(args, capture_output=True, text=True, check=True)
 
-        uuid_result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,uuid",
-                "--format=csv,noheader",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        uuid_to_idx = {}
-        for line in uuid_result.stdout.strip().split("\n"):
-            if "," in line:
+    def snapshot(self) -> list[GpuSnapshot]:
+        """Get list of GPUs with their status (free = no processes running)."""
+        try:
+            result = self._run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ]
+            )
+            gpus: dict[int, GpuSnapshot] = {}
+            for line in result.stdout.strip().split("\n"):
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2:
-                    uuid_to_idx[parts[1]] = int(parts[0])
+                if len(parts) >= 3:
+                    idx = int(parts[0])
+                    used = int(parts[1])
+                    total = int(parts[2])
+                    util = 0
+                    if len(parts) >= 4 and parts[3].strip().isdigit():
+                        util = int(parts[3].strip())
 
-        proc_result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+                    gpus[idx] = {
+                        "index": idx,
+                        "used_mb": used,
+                        "total_mb": total,
+                        "util": util,
+                        "free": True,
+                        "processes": [],
+                    }
 
-        for line in proc_result.stdout.strip().split("\n"):
-            if "," in line:
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 4:
-                    gpu_uuid, pid_str, proc_name, mem_str = (
-                        parts[0],
-                        parts[1],
-                        parts[2],
-                        parts[3],
-                    )
-                    if gpu_uuid in uuid_to_idx:
-                        idx = uuid_to_idx[gpu_uuid]
-                        if idx in gpus:
-                            is_zombie = proc_name == "[Not Found]"
-                            if not is_zombie:
-                                try:
-                                    pid = int(pid_str)
-                                    if not Path(f"/proc/{pid}").exists():
+            uuid_result = self._run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,uuid",
+                    "--format=csv,noheader",
+                ]
+            )
+            uuid_to_idx = {}
+            for line in uuid_result.stdout.strip().split("\n"):
+                if "," in line:
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 2:
+                        uuid_to_idx[parts[1]] = int(parts[0])
+
+            proc_result = self._run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+                    "--format=csv,noheader,nounits",
+                ]
+            )
+
+            for line in proc_result.stdout.strip().split("\n"):
+                if "," in line:
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 4:
+                        gpu_uuid, pid_str, proc_name, mem_str = (
+                            parts[0],
+                            parts[1],
+                            parts[2],
+                            parts[3],
+                        )
+                        if gpu_uuid in uuid_to_idx:
+                            idx = uuid_to_idx[gpu_uuid]
+                            if idx in gpus:
+                                is_zombie = proc_name == "[Not Found]"
+                                if not is_zombie:
+                                    try:
+                                        pid = int(pid_str)
+                                        if not self.pid_exists(pid):
+                                            is_zombie = True
+                                    except ValueError:
                                         is_zombie = True
-                                except ValueError:
-                                    is_zombie = True
 
-                            user = "unknown"
-                            if "/home/" in proc_name:
-                                user = proc_name.split("/home/")[1].split("/")[0]
-                            elif is_zombie:
-                                user = "zombie"
+                                user = "unknown"
+                                if "/home/" in proc_name:
+                                    user = proc_name.split("/home/")[1].split("/")[0]
+                                elif is_zombie:
+                                    user = "zombie"
 
-                            gpus[idx]["processes"].append(
-                                {
-                                    "pid": pid_str,
-                                    "user": user,
-                                    "name": proc_name.split("/")[-1]
-                                    if "/" in proc_name
-                                    else proc_name,
-                                    "mem_mb": int(mem_str) if mem_str.isdigit() else 0,
-                                    "zombie": is_zombie,
-                                }
-                            )
+                                gpus[idx]["processes"].append(
+                                    {
+                                        "pid": pid_str,
+                                        "user": user,
+                                        "name": proc_name.split("/")[-1]
+                                        if "/" in proc_name
+                                        else proc_name,
+                                        "mem_mb": int(mem_str)
+                                        if mem_str.isdigit()
+                                        else 0,
+                                        "zombie": is_zombie,
+                                    }
+                                )
 
-                            if not is_zombie:
-                                gpus[idx]["free"] = False
+                                if not is_zombie:
+                                    gpus[idx]["free"] = False
 
-        return list(gpus.values())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
+            return list(gpus.values())
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return []
+
+
+def get_free_gpus() -> list[GpuSnapshot]:
+    return NvidiaSmiGpuProvider().snapshot()
 
 
 def get_available_gpu_indices() -> list[int]:

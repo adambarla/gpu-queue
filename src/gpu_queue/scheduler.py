@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from gpu_queue import paths
+from gpu_queue.domain import GpuSnapshot
 from gpu_queue.gpu import get_free_gpus
 from gpu_queue.logs import log_msg
 from gpu_queue.storage import locked_queue
@@ -191,7 +192,10 @@ def daemon_loop(
 
 
 def _write_status(
-    all_gpus: list[dict], min_free: int, max_use: Optional[int], excluded_gpus: set[int]
+    all_gpus: list[GpuSnapshot],
+    min_free: int,
+    max_use: Optional[int],
+    excluded_gpus: set[int],
 ) -> None:
     try:
         status_data = {
