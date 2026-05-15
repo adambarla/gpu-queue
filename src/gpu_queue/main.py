@@ -22,7 +22,6 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -30,8 +29,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, cast
 
+from gpu_queue.commands import (
+    cmd_add,
+    cmd_cancel,
+    cmd_clear,
+    cmd_logs,
+    cmd_pause,
+    cmd_retry,
+    cmd_serve,
+    cmd_start,
+    cmd_stop,
+)
 from gpu_queue.gpu import get_available_gpu_indices, get_free_gpus
-from gpu_queue.logs import log_msg
+from gpu_queue.ids import generate_job_id
 from gpu_queue.paths import (
     DAEMON_LOG,
     LOCK_FILE,
@@ -61,7 +71,6 @@ from gpu_queue.scheduler import (
     run_job,
 )
 from gpu_queue.storage import (
-    ensure_dirs,
     load_queue,
     load_queue_raw,
     locked_queue,
@@ -70,8 +79,12 @@ from gpu_queue.storage import (
 )
 
 __all__ = [
+    "DAEMON_LOG",
     "LOCK_FILE",
+    "LOG_DIR",
     "MIN_FREE_GPUS",
+    "PID_FILE",
+    "QUEUE_DIR",
     "QUEUE_FILE",
     "SERVER_PORT",
     "cleanup_dead_jobs",
@@ -103,122 +116,6 @@ GPU_COL_IDX_W = 4
 GPU_COL_UTIL_W = 4  # "100%"
 GPU_COL_MEM_W = 14
 GPU_MIN_PROC_W = 8
-
-
-def generate_job_id() -> str:
-    """Generate a short unique job ID."""
-    import hashlib
-
-    ts = datetime.now().isoformat()
-    return hashlib.md5(ts.encode()).hexdigest()[:8]
-
-
-def cmd_serve(args):
-    """Run the scheduler loop in the foreground."""
-    ensure_dirs()
-    max_use = getattr(args, "max_use", None)
-    print(f"✓ Scheduler started (keeping {args.min_free} GPUs physically idle)")
-    if max_use is not None:
-        print(f"  Max gpu-queue use: {max_use} GPUs")
-    print(f"  Polling every {POLL_INTERVAL}s")
-
-    # Parse excluded GPUs
-    excluded = set()
-    if getattr(args, "exclude_gpus", None):
-        try:
-            for p in args.exclude_gpus.split(","):
-                if p.strip():
-                    excluded.add(int(p.strip()))
-        except ValueError:
-            print("Error: Invalid format for --exclude-gpus.")
-            sys.exit(1)
-
-    daemon_loop(args.min_free, excluded, max_use=max_use)
-
-
-# === CLI Commands ===
-
-
-def cmd_add(args):
-    """Add a job to the queue."""
-    priorities = {"low": 0, "medium": 1, "high": 2}
-    prio = priorities.get(args.priority, 1)
-    if args.front:
-        prio = 3
-
-    job = {
-        "id": generate_job_id(),
-        "cmd": args.command,
-        "gpus": args.gpus,
-        "added": datetime.now().isoformat(),
-        "priority": prio,
-    }
-
-    with locked_queue() as queue:
-        if args.front:
-            queue["pending"].insert(0, job)
-        else:
-            queue["pending"].append(job)
-
-    print(f"✓ Added job {job['id']} (requires {args.gpus} GPUs)")
-    print(f"  Command: {args.command}")
-
-
-def cmd_start(args):
-    """Start the daemon."""
-    ensure_dirs()
-    max_use = getattr(args, "max_use", None)
-
-    if is_daemon_running():
-        print("Daemon is already running!")
-        return
-
-    # Fork to background
-    pid = os.fork()
-    if pid > 0:
-        # Parent process
-        print(f"✓ Daemon started (PID: {pid})")
-        print(f"  Polling every {POLL_INTERVAL}s for free GPUs")
-        print(f"  Log: {DAEMON_LOG}")
-        return
-
-    # Child process - become daemon
-    os.setsid()
-    os.chdir("/")
-
-    # Write PID file with configuration
-    PID_FILE.write_text(str(os.getpid()))
-
-    # Store config in separate file or just run with args
-    (QUEUE_DIR / "config.json").write_text(
-        json.dumps({"min_free_gpus": args.min_free, "max_use_gpus": max_use})
-    )
-
-    # Redirect stdout/stderr
-    sys.stdout = open(DAEMON_LOG, "a")
-    sys.stderr = sys.stdout
-
-    # Handle termination
-    def handle_signal(signum, frame):
-        log_msg("Daemon stopped")
-        PID_FILE.unlink(missing_ok=True)
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    daemon_loop(args.min_free, max_use=max_use)
-
-
-def cmd_stop(args):
-    """Stop the daemon."""
-    if not is_daemon_running():
-        print("Daemon is not running.")
-        return
-
-    pid = int(PID_FILE.read_text().strip())
-    os.kill(pid, signal.SIGTERM)
-    print(f"✓ Stopped daemon (PID: {pid})")
 
 
 def get_terminal_width() -> int:
@@ -305,139 +202,6 @@ def shorten_command(cmd: str, max_len: int) -> str:
 
 
 # cmd_status removed - functionality merged into watch TUI
-
-
-def cmd_cancel(args):
-    """Cancel a pending job."""
-    with locked_queue() as queue:
-        for i, job in enumerate(queue["pending"]):
-            if job["id"] == args.job_id:
-                queue["pending"].pop(i)
-                print(f"✓ Cancelled pending job {args.job_id}")
-                return
-
-        # Also check running
-        for i, job in enumerate(queue["running"]):
-            if job["id"] == args.job_id:
-                pid = job.get("pid")
-                if pid:
-                    try:
-                        os.killpg(pid, signal.SIGKILL)  # Aggressive kill
-                    except Exception:
-                        pass
-                queue["running"].pop(i)
-                job["status"] = "cancelled"
-                job["ended"] = datetime.now().isoformat()
-                queue["completed"].append(job)
-                print(f"✓ Cancelled running job {args.job_id}")
-                return
-
-    print(f"Job {args.job_id} not found")
-
-
-def cmd_logs(args):
-    """Show logs for a job."""
-    log_file = LOG_DIR / f"{args.job_id}.log"
-    if not log_file.exists():
-        print(f"No log file for job {args.job_id}")
-        return
-
-    # Tail the log
-    lines = args.lines
-    with open(log_file) as f:
-        content = f.readlines()
-        for line in content[-lines:]:
-            print(line, end="")
-
-
-def cmd_clear(args):
-    """Clear completed jobs from the queue."""
-    with locked_queue() as queue:
-        count = len(queue["completed"])
-        queue["completed"] = []
-    print(f"✓ Cleared {count} completed jobs")
-
-
-def cmd_delete(args):
-    """Delete a job from the completed list."""
-    with locked_queue() as queue:
-        for i, job in enumerate(queue["completed"]):
-            if job["id"] == args.job_id:
-                queue["completed"].pop(i)
-                print(f"✓ Deleted job {args.job_id}")
-                return
-    print(f"Job {args.job_id} not found in completed jobs")
-
-
-def cmd_retry(args):
-    """Re-queue a completed job."""
-    with locked_queue() as queue:
-        # Find job in completed
-        for i, job in enumerate(queue["completed"]):
-            if job["id"] == args.job_id:
-                # Remove from completed
-                queue["completed"].pop(i)
-
-                # Reset job metadata but KEEP THE ID if requested or default behavior?
-                # User asked to not duplicate. Reusing ID is best.
-                # But we should update 'added' time? Or keep original?
-                # Let's update added time to reflect it's back in queue.
-
-                new_job = {
-                    "id": job["id"],  # Reuse ID
-                    "cmd": job["cmd"],
-                    "gpus": job.get("gpus", 1),
-                    "added": datetime.now().isoformat(),
-                    "retried_at": datetime.now().isoformat(),
-                    "priority": 1,
-                }
-
-                # Add to front or back of pending
-                if args.front:
-                    queue["pending"].insert(0, new_job)
-                    print(f"✓ Re-queued job {job['id']} (front)")
-                else:
-                    queue["pending"].append(new_job)
-                    print(f"✓ Re-queued job {job['id']} (back)")
-                return
-
-    print(f"Job {args.job_id} not found in completed jobs")
-
-
-def cmd_pause(args):
-    """Pause a running job (kill and re-queue at front)."""
-    with locked_queue() as queue:
-        # Find job in running
-        for i, job in enumerate(queue["running"]):
-            if job["id"] == args.job_id:
-                pid = job.get("pid")
-                if pid:
-                    try:
-                        # Aggressive kill to free GPU instantly
-                        os.killpg(pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-
-                # Remove from running
-                queue["running"].pop(i)
-
-                # Reset metadata for re-queue
-                new_job = {
-                    "id": generate_job_id(),
-                    "cmd": job["cmd"],
-                    "gpus": job.get("gpus", 1),
-                    "added": datetime.now().isoformat(),
-                    "priority": 3,  # Urgent
-                    "paused_from": job["id"],
-                }
-
-                # Add to front of pending queue
-                queue["pending"].insert(0, new_job)
-                print(f"✓ Paused job {job['id']} (Killed process group {pid})")
-                print(f"✓ Re-queued as {new_job['id']} at front")
-                return
-
-    print(f"Job {args.job_id} not found in running jobs")
 
 
 def get_status_data():
