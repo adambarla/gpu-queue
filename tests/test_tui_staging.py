@@ -3,13 +3,21 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 from unittest.mock import patch
 
 from gpu_queue import main as mod
+from gpu_queue import paths
 
 
-def _job(job_id: str, *, cmd: str = "echo hi", gpus: int = 1, added: str = "2026-01-01T00:00:00", status: Optional[str] = None) -> dict:
+def _job(
+    job_id: str,
+    *,
+    cmd: str = "echo hi",
+    gpus: int = 1,
+    added: str = "2026-01-01T00:00:00",
+    status: Optional[str] = None,
+) -> dict:
     job = {"id": job_id, "cmd": cmd, "gpus": gpus, "added": added}
     if status is not None:
         job["status"] = status
@@ -22,15 +30,17 @@ class TuiStagingTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.queue_dir = Path(self.tmp.name) / ".gpu_queue"
         self.stack = ExitStack()
-        for name, value in {
+        path_values = {
             "QUEUE_DIR": self.queue_dir,
             "QUEUE_FILE": self.queue_dir / "jobs.json",
             "PID_FILE": self.queue_dir / "daemon.pid",
             "DAEMON_LOG": self.queue_dir / "daemon.log",
             "LOG_DIR": self.queue_dir / "logs",
             "LOCK_FILE": self.queue_dir / "queue.lock",
-        }.items():
+        }
+        for name, value in path_values.items():
             self.stack.enter_context(patch.object(mod, name, value))
+            self.stack.enter_context(patch.object(paths, name, value))
         self.addCleanup(self.stack.close)
 
     def write_queue(self, data: dict) -> None:
@@ -67,6 +77,10 @@ class TuiStagingTest(unittest.TestCase):
                 return i
         raise AssertionError("completed window not found")
 
+    def require_modal(self, tui: mod.GPUQueueTUI) -> dict[str, Any]:
+        self.assertIsNotNone(tui.modal)
+        return cast(dict[str, Any], tui.modal)
+
     def test_prompt_new_job_inserts_on_top(self):
         tui = self.load_tui(
             {
@@ -101,8 +115,10 @@ class TuiStagingTest(unittest.TestCase):
         tui.do_action("edit")
 
         self.assertTrue(tui.edit_mode_active)
-        self.assertEqual(tui.edit_job["id"], "s1")
-        self.assertEqual(tui.edit_job["cmd"], "python train.py")
+        self.assertIsNotNone(tui.edit_job)
+        edit_job = cast(dict[str, Any], tui.edit_job)
+        self.assertEqual(edit_job["id"], "s1")
+        self.assertEqual(edit_job["cmd"], "python train.py")
 
     def test_cancel_staged_job_moves_to_completed(self):
         tui = self.load_tui(
@@ -118,7 +134,7 @@ class TuiStagingTest(unittest.TestCase):
         tui.windows[idx].selected_idx = 0
 
         tui.do_action("cancel")
-        tui.modal["on_confirm"]()
+        self.require_modal(tui)["on_confirm"]()
 
         data = mod.load_queue_raw()
         self.assertEqual(data["staging"], [])
@@ -134,14 +150,17 @@ class TuiStagingTest(unittest.TestCase):
                 "completed": [_job("c1", cmd="python eval.py", status="failed")],
             }
         )
-        completed_idx = next(i for i, win in enumerate(tui.windows) if win.key == "completed")
+        completed_idx = next(
+            i for i, win in enumerate(tui.windows) if win.key == "completed"
+        )
         tui.active_win_idx = completed_idx
         tui.windows[completed_idx].selected_idx = 0
 
         tui.do_action("retry")
-        self.assertEqual(tui.modal["type"], "CONFIRM")
-        self.assertIn("old logs", tui.modal["text"])
-        tui.modal["on_confirm"]()
+        modal = self.require_modal(tui)
+        self.assertEqual(modal["type"], "CONFIRM")
+        self.assertIn("old logs", modal["text"])
+        modal["on_confirm"]()
 
         data = mod.load_queue_raw()
         self.assertEqual(data["completed"], [])
@@ -205,8 +224,9 @@ class TuiStagingTest(unittest.TestCase):
         tui.windows[idx].selected_idx = 0
 
         tui.do_action("send_to_pending")
-        self.assertEqual(tui.modal["type"], "CONFIRM")
-        tui.modal["on_confirm"]()
+        modal = self.require_modal(tui)
+        self.assertEqual(modal["type"], "CONFIRM")
+        modal["on_confirm"]()
 
         data = mod.load_queue_raw()
         self.assertEqual(data["staging"], [])
@@ -221,7 +241,9 @@ class TuiStagingTest(unittest.TestCase):
                 "completed": [],
             }
         )
-        pending_idx = next(i for i, win in enumerate(tui.windows) if win.key == "pending")
+        pending_idx = next(
+            i for i, win in enumerate(tui.windows) if win.key == "pending"
+        )
         tui.active_win_idx = pending_idx
         tui.windows[pending_idx].selected_idx = 1
 
@@ -250,7 +272,9 @@ class TuiStagingTest(unittest.TestCase):
         tui.execute_action("move_pending_up", "p3")
 
         data = mod.load_queue_raw()
-        self.assertEqual([j["id"] for j in data["pending"][:4]], ["p0", "p1", "p3", "p2"])
+        self.assertEqual(
+            [j["id"] for j in data["pending"][:4]], ["p0", "p1", "p3", "p2"]
+        )
         self.assertEqual(win.selected_idx, 2)
         self.assertEqual(win.scroll_offset, 2)
 
@@ -380,8 +404,9 @@ class TuiStagingTest(unittest.TestCase):
         tui.selected_job_ids["pending"] = {"p1", "p3"}
 
         tui.do_action("cancel")
-        self.assertEqual(tui.modal["type"], "CONFIRM")
-        tui.modal["on_confirm"]()
+        modal = self.require_modal(tui)
+        self.assertEqual(modal["type"], "CONFIRM")
+        modal["on_confirm"]()
 
         data = mod.load_queue_raw()
         self.assertEqual([j["id"] for j in data["pending"]], ["p2"])
@@ -443,7 +468,7 @@ class TuiStagingTest(unittest.TestCase):
         tui.selected_job_ids["staging"] = {"s1", "s3"}
 
         tui.do_action("send_to_pending")
-        tui.modal["on_confirm"]()
+        self.require_modal(tui)["on_confirm"]()
 
         data = mod.load_queue_raw()
         self.assertEqual([j["id"] for j in data["staging"]], ["s2"])
@@ -466,8 +491,9 @@ class TuiStagingTest(unittest.TestCase):
         tui.selected_job_ids["completed"] = {"c1", "c2"}
 
         tui.do_action("retry")
-        self.assertEqual(tui.modal["type"], "CONFIRM")
-        tui.modal["on_confirm"]()
+        modal = self.require_modal(tui)
+        self.assertEqual(modal["type"], "CONFIRM")
+        modal["on_confirm"]()
 
         data = mod.load_queue_raw()
         self.assertEqual(data["completed"], [])
@@ -596,7 +622,13 @@ class TuiStagingTest(unittest.TestCase):
         tui.mode = "ACTION"
         tui.active_win_idx = self.pending_idx(tui)
         tui.gpu_status = [
-            {"index": i, "used_mb": 1000, "total_mb": 24000, "util": 50, "processes": []}
+            {
+                "index": i,
+                "used_mb": 1000,
+                "total_mb": 24000,
+                "util": 50,
+                "processes": [],
+            }
             for i in range(8)
         ]
         next(win for win in tui.windows if win.key == "staging").collapsed = True
@@ -606,6 +638,7 @@ class TuiStagingTest(unittest.TestCase):
             tui.draw()
 
         self.assertEqual(tui.stdscr.errors, [])
+
 
 class FakeScreen:
     def __init__(self, height: int, width: int):

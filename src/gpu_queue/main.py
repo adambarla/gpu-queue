@@ -17,7 +17,6 @@ Usage:
 import argparse
 import copy
 import curses
-import fcntl
 import json
 import os
 import shutil
@@ -27,24 +26,52 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, cast
 
+from gpu_queue.logs import log_msg
+from gpu_queue.paths import (
+    DAEMON_LOG,
+    LOCK_FILE,
+    LOG_DIR,
+    MIN_FREE_GPUS,
+    PID_FILE,
+    POLL_INTERVAL,
+    QUEUE_DIR,
+    QUEUE_FILE,
+    SERVER_PORT,
+    get_server_url,
+)
 from gpu_queue.queue_state import (
     cancel_staged_job,
-    empty_queue,
     insert_staged_job,
-    load_queue_file,
     make_staged_job,
     move_pending_job,
-    move_pending_jobs,
     move_pending_job_to_staging,
-    save_queue_file,
+    move_pending_jobs,
     send_staged_job_to_pending,
     stage_completed_retry,
 )
+from gpu_queue.storage import (
+    ensure_dirs,
+    load_queue,
+    load_queue_raw,
+    locked_queue,
+    save_queue,
+    save_queue_raw,
+)
+
+__all__ = [
+    "LOCK_FILE",
+    "MIN_FREE_GPUS",
+    "QUEUE_FILE",
+    "SERVER_PORT",
+    "get_server_url",
+    "load_queue_raw",
+    "save_queue",
+    "save_queue_raw",
+]
 
 # Try importing requests. Env should have it. Fallback if needed.
 try:
@@ -52,20 +79,10 @@ try:
 except ImportError:
     requests = None
 
-# Configuration
-QUEUE_DIR = Path.home() / ".gpu_queue"
-QUEUE_FILE = QUEUE_DIR / "jobs.json"
-PID_FILE = QUEUE_DIR / "daemon.pid"
-DAEMON_LOG = QUEUE_DIR / "daemon.log"
-LOG_DIR = QUEUE_DIR / "logs"
-
-POLL_INTERVAL = 2  # seconds between GPU checks
-MIN_FREE_GPUS = 2  # Number of physically idle GPUs to always keep free
-SERVER_PORT = 12345
-
 CMD_FIELD_GHOST = "<press enter to edit command>"
 
-# Sparkline for GPU util (U+2581..U+2588). Buffer ≥ max spark columns so full width scrolls.
+# Sparkline for GPU util (U+2581..U+2588).
+# Buffer >= max spark columns so full width scrolls.
 _BLOCK_SPARK_CHARS = "▁▂▃▄▅▆▇█"
 GPU_UTIL_HISTORY_MAX_SAMPLES = 512
 # GPU STATUS table: fixed widths so header and rows align (content inside borders)
@@ -73,57 +90,6 @@ GPU_COL_IDX_W = 4
 GPU_COL_UTIL_W = 4  # "100%"
 GPU_COL_MEM_W = 14
 GPU_MIN_PROC_W = 8
-
-
-def get_server_url():
-    return f"http://localhost:{SERVER_PORT}"
-
-
-def ensure_dirs():
-    """Create queue directories if they don't exist."""
-    QUEUE_DIR.mkdir(exist_ok=True)
-    LOG_DIR.mkdir(exist_ok=True)
-
-
-LOCK_FILE = QUEUE_DIR / "queue.lock"
-
-
-@contextmanager
-def locked_queue():
-    """Context manager for thread-safe and process-safe queue access."""
-    ensure_dirs()
-    with open(LOCK_FILE, "w") as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            queue = load_queue_raw()
-            yield queue
-            save_queue_raw(queue)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
-def load_queue_raw() -> dict[str, list]:
-    """Load the job queue from disk without locking."""
-    try:
-        return load_queue_file(QUEUE_FILE)
-    except (json.JSONDecodeError, ValueError) as e:
-        log_msg(f"Error loading queue JSON: {e}")
-        return empty_queue()
-
-
-def save_queue_raw(queue: dict[str, list]):
-    """Save the job queue to disk without locking (atomic replace)."""
-    save_queue_file(QUEUE_FILE, queue)
-
-
-def load_queue() -> dict[str, list]:
-    """Load the job queue (backward compatibility, no lock)."""
-    return load_queue_raw()
-
-
-def save_queue(queue: dict[str, list]):
-    """Save the job queue (backward compatibility, no lock)."""
-    save_queue_raw(queue)
 
 
 def generate_job_id() -> str:
@@ -499,16 +465,6 @@ def cmd_serve(args):
     daemon_loop(args.min_free, excluded, max_use=max_use)
 
 
-def log_msg(msg: str, verbose: bool = False):
-    """Log a message to the daemon log."""
-    if verbose:
-        return  # Skip verbose messages for now
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}\n"
-    with open(DAEMON_LOG, "a") as f:
-        f.write(line)
-
-
 # === CLI Commands ===
 
 
@@ -616,7 +572,7 @@ def sparkline_trailing(util_series: list[int], width: int) -> str:
 
 
 def _gpu_status_column_widths(inner: int) -> tuple[int, int, int]:
-    """Return (prefix_w, hist_w, proc_w). Row is prefix + ' ' + [hist + ' '] + proc (full inner)."""
+    """Return (prefix_w, hist_w, proc_w) for one full-width status row."""
     prefix_w = GPU_COL_IDX_W + 1 + GPU_COL_UTIL_W + 1 + GPU_COL_MEM_W
     slack = inner - prefix_w
     if slack <= 0:
@@ -854,6 +810,7 @@ class Window:
         self.selected_idx = 0
         self.scroll_offset = 0
         self.height_pct = height_pct  # Target height percentage
+        self.height: Optional[int] = None
         self.collapsed = False
 
     def update_items(self, items):
@@ -983,6 +940,7 @@ class GPUQueueTUI:
     def _calc_col_widths(self):
         """Calculate column widths based on current data for all tables."""
         try:
+
             def calc_queue_widths(items: list[dict[str, Any]]) -> dict[str, int]:
                 widths = {"id": 3, "gpus": 4, "waiting": 7}
                 for job in items:
@@ -1162,9 +1120,8 @@ class GPUQueueTUI:
         ids = {str(jid) for jid in jids}
         for selected in self.selected_job_ids.values():
             selected.difference_update(ids)
-        if (
-            self.select_mode_window_key is not None
-            and not self.selected_job_ids.get(self.select_mode_window_key)
+        if self.select_mode_window_key is not None and not self.selected_job_ids.get(
+            self.select_mode_window_key
         ):
             self._exit_select_mode()
 
@@ -1363,7 +1320,9 @@ class GPUQueueTUI:
 
             # Use dynamic column widths
             cw = self.col_widths["staging" if job["_type"] == "staging" else "pending"]
-            prefix = f" {jid:<{cw['id']}} {gpus:<{cw['gpus']}} {waiting:<{cw['waiting']}} "
+            prefix = (
+                f" {jid:<{cw['id']}} {gpus:<{cw['gpus']}} {waiting:<{cw['waiting']}} "
+            )
 
         else:
             # Completed/Finished
@@ -1548,9 +1507,7 @@ class GPUQueueTUI:
             gpu_h = nonqueue_heights["gpu_status"]
             job_h = nonqueue_heights["job_details"]
             remaining_h = max(0, avail_h - sum(nonqueue_heights.values()))
-            visible_queue_keys = [
-                k for k in queue_keys if not win_by_key[k].collapsed
-            ]
+            visible_queue_keys = [k for k in queue_keys if not win_by_key[k].collapsed]
             heights_by_key = {
                 "running": running_h,
                 "gpu_status": gpu_h,
@@ -1747,7 +1704,9 @@ class GPUQueueTUI:
             row_attr = curses.A_NORMAL
 
             if not self.gpu_status:
-                self.stdscr.addstr(y + 1, left, "No GPU info available", curses.A_NORMAL)
+                self.stdscr.addstr(
+                    y + 1, left, "No GPU info available", curses.A_NORMAL
+                )
                 return
 
             hdr_idx = "IDX".ljust(GPU_COL_IDX_W)[:GPU_COL_IDX_W]
@@ -1800,9 +1759,7 @@ class GPUQueueTUI:
                 col = left + prefix_w + 1
                 if hist_w > 0:
                     hist = (
-                        self._gpu_util_history.get(int(idx), [])
-                        if idx != "?"
-                        else []
+                        self._gpu_util_history.get(int(idx), []) if idx != "?" else []
                     )
                     spark = sparkline_trailing(hist, hist_w)
                     self.stdscr.addstr(line_y, col, spark, row_attr)
@@ -1845,7 +1802,9 @@ class GPUQueueTUI:
             gpu_s = str(job.get("gpus", "-"))
             meta_str = f"ID: {jid} | Queue: {queue_s} | Status: {st} | GPUs: {gpu_s}"
             inner_w = max(1, w - 4)
-            self.stdscr.addstr(y, x + 2, _fit_text_field(meta_str, inner_w), curses.A_BOLD)
+            self.stdscr.addstr(
+                y, x + 2, _fit_text_field(meta_str, inner_w), curses.A_BOLD
+            )
 
             cmd = job.get("cmd", "")
             # Normalize command (remove newlines)
@@ -2099,7 +2058,8 @@ class GPUQueueTUI:
             help_str = " Q:Quit "
             if self.edit_mode_active:
                 help_str += (
-                    "e:Save Staging  Esc:Cancel  h/l:Field  j/k:GPUs  Enter:command editor"
+                    "e:Save Staging  Esc:Cancel  h/l:Field  "
+                    "j/k:GPUs  Enter:command editor"
                 )
             elif self.mode == "NAV":
                 help_str += "j/k:Select  l:Focus  n:New Job  Tab:Collapse"
@@ -2111,7 +2071,9 @@ class GPUQueueTUI:
                 elif win.key == "staging":
                     help_str += "h:Back  v:Select  c:Discard  e:Edit  s:Send  d:Dup"
                 elif win.key == "pending":
-                    help_str += "h:Back  v:Select  b:Stage  c:Cancel  J/K:Reorder  Space:Log"
+                    help_str += (
+                        "h:Back  v:Select  b:Stage  c:Cancel  J/K:Reorder  Space:Log"
+                    )
                 elif win.key == "running":
                     help_str += "h:Back  v:Select  Space:Log  c:Cancel  p:Pause  d:Dup"
                 elif win.key == "completed":
@@ -2596,7 +2558,9 @@ class GPUQueueTUI:
             if not job:
                 return
             jids = [str(job["id"])]
-        elif action in {"move_pending_up", "move_pending_down"} and win.key == "pending":
+        elif (
+            action in {"move_pending_up", "move_pending_down"} and win.key == "pending"
+        ):
             selected = self._selected_ids_for_window(win)
             if selected:
                 jids = selected
@@ -2696,9 +2660,7 @@ class GPUQueueTUI:
                 "text": (
                     f"Retry {target}? This may replace or overwrite access to old logs."
                 ),
-                "on_confirm": lambda jids=jids: self.execute_bulk_action(
-                    "retry", jids
-                ),
+                "on_confirm": lambda jids=jids: self.execute_bulk_action("retry", jids),
                 "on_cancel": None,
             }
             return
@@ -2721,7 +2683,9 @@ class GPUQueueTUI:
 
         if action in ["move_pending_up", "move_pending_down"]:
             offset = -1 if action == "move_pending_up" else 1
-            focus_jid = str(kwargs.get("focus_jid")) if kwargs.get("focus_jid") else None
+            focus_jid = (
+                str(kwargs.get("focus_jid")) if kwargs.get("focus_jid") else None
+            )
             queue_snapshot = None
             with locked_queue() as q:
                 if move_pending_jobs(q, jids, offset):
@@ -2964,7 +2928,12 @@ class GPUQueueTUI:
         except Exception as e:
             msg = f"Err: {str(e)}"
 
-        if action not in ["dup", "move_pending_up", "move_pending_down", "update_staging"]:
+        if action not in [
+            "dup",
+            "move_pending_up",
+            "move_pending_down",
+            "update_staging",
+        ]:
             self._clear_selected_ids([jid])
         self.action_msg = msg
         self.msg_clear_time = time.time() + 2.0
