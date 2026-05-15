@@ -43,6 +43,7 @@ def cmd_add(args) -> None:
         gpus=args.gpus,
         priority=args.priority,
         front=args.front,
+        cwd=os.getcwd(),
     )
 
     print(f"✓ Added job {job['id']} (requires {args.gpus} GPUs)")

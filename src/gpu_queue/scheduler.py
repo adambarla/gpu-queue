@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from gpu_queue import paths
-from gpu_queue.domain import GpuSnapshot
+from gpu_queue.domain import GpuSnapshot, Job, SchedulerConfig
 from gpu_queue.gpu import get_free_gpus
 from gpu_queue.logs import log_msg
+from gpu_queue.policies import FifoSchedulerPolicy
+from gpu_queue.runner import SubprocessJobRunner
 from gpu_queue.storage import locked_queue
 
 
@@ -63,50 +63,9 @@ def cleanup_dead_jobs() -> None:
             queue["running"] = still_running
 
 
-def run_job(job: dict, gpu_indices: list[int]) -> int:
+def run_job(job: Job, gpu_indices: list[int]) -> int:
     """Run a job with the specified GPUs. Returns the PID."""
-    log_file = paths.LOG_DIR / f"{job['id']}.log"
-    exit_file = paths.QUEUE_DIR / f"{job['id']}.exit"
-    gpu_str = ",".join(map(str, gpu_indices))
-
-    cmd = " ".join(job["cmd"].split())
-
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = gpu_str
-    local_bin = str(Path.home() / ".local" / "bin")
-    if local_bin not in env.get("PATH", ""):
-        env["PATH"] = f"{local_bin}:{env.get('PATH', '')}"
-
-    with open(log_file, "w") as f:
-        f.write(f"=== Job {job['id']} ===\n")
-        f.write(f"Command: {cmd}\n")
-        f.write(f"GPUs: {gpu_str}\n")
-        f.write(f"Started: {datetime.now().isoformat()}\n")
-        f.write("=" * 40 + "\n\n")
-
-    q_log = f"'{log_file}'"
-    q_exit = f"'{exit_file}'"
-    wrapped_cmd = f"({cmd}) >> {q_log} 2>&1; echo $? > {q_exit}"
-
-    proc = subprocess.Popen(
-        wrapped_cmd,
-        shell=True,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=Path.home() / "pepo",
-        start_new_session=True,
-    )
-
-    return proc.pid
-
-
-def _running_gpu_usage(job: dict) -> int:
-    assigned = job.get("assigned_gpus", [])
-    if assigned:
-        return len(assigned)
-    return int(job.get("gpus", 1))
+    return SubprocessJobRunner().start(job, gpu_indices)
 
 
 def daemon_loop(
@@ -115,6 +74,7 @@ def daemon_loop(
     """Main scheduler loop."""
     if excluded_gpus is None:
         excluded_gpus = set()
+    policy = FifoSchedulerPolicy()
 
     while True:
         try:
@@ -123,59 +83,40 @@ def daemon_loop(
             with locked_queue() as queue:
                 if queue["pending"]:
                     all_gpus = get_free_gpus()
-                    gpus = [g for g in all_gpus if g["index"] not in excluded_gpus]
-
-                    our_assigned = set()
-                    our_usage = 0
-                    for j in queue["running"]:
-                        our_usage += _running_gpu_usage(j)
-                        for idx in j.get("assigned_gpus", []):
-                            our_assigned.add(idx)
-
-                    actual_free_count = sum(
-                        1
-                        for g in all_gpus
-                        if g["free"] and g["index"] not in our_assigned
+                    config = SchedulerConfig(
+                        min_free=min_free,
+                        max_use=max_use,
+                        excluded_gpus=frozenset(excluded_gpus),
                     )
-                    startable_gpus = max(0, actual_free_count - min_free)
-                    if max_use is not None:
-                        startable_gpus = min(
-                            startable_gpus, max(0, max_use - our_usage)
-                        )
+                    plans = policy.plan(queue, all_gpus, config)
+                    if plans:
+                        pending_by_id = {
+                            str(job.get("id")): job for job in queue["pending"]
+                        }
+                        started_ids = set()
+                        for plan in plans:
+                            job = pending_by_id.get(plan.job_id)
+                            if job is None:
+                                continue
+                            log_msg(
+                                f"Starting job {job['id']} on GPUs {plan.gpu_indices}"
+                            )
 
-                    free_indices = [
-                        g["index"]
-                        for g in gpus
-                        if g["free"] and g["index"] not in our_assigned
-                    ]
+                            pid = run_job(job, plan.gpu_indices)
 
-                    if startable_gpus > 0:
-                        jobs_started = False
-                        remaining_pending = []
+                            job["pid"] = pid
+                            job["assigned_gpus"] = plan.gpu_indices
+                            job["status"] = "running"
+                            job["started"] = datetime.now().isoformat()
+                            queue["running"].append(job)
+                            started_ids.add(plan.job_id)
 
-                        for job in queue["pending"]:
-                            req = job.get("gpus", 1)
-
-                            if req <= startable_gpus and req <= len(free_indices):
-                                assigned = free_indices[:req]
-                                log_msg(f"Starting job {job['id']} on GPUs {assigned}")
-
-                                pid = run_job(job, assigned)
-
-                                job["pid"] = pid
-                                job["assigned_gpus"] = assigned
-                                job["status"] = "running"
-                                job["started"] = datetime.now().isoformat()
-                                queue["running"].append(job)
-
-                                startable_gpus -= req
-                                free_indices = free_indices[req:]
-                                jobs_started = True
-                            else:
-                                remaining_pending.append(job)
-
-                        if jobs_started:
-                            queue["pending"] = remaining_pending
+                        if started_ids:
+                            queue["pending"] = [
+                                job
+                                for job in queue["pending"]
+                                if str(job.get("id")) not in started_ids
+                            ]
 
                     _write_status(all_gpus, min_free, max_use, excluded_gpus)
                 else:

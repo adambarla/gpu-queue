@@ -32,3 +32,9 @@ class SchedulerConfig:
     min_free: int = 2
     max_use: int | None = None
     excluded_gpus: frozenset[int] = frozenset()
+
+
+@dataclass(frozen=True)
+class JobStartPlan:
+    job_id: str
+    gpu_indices: list[int]
