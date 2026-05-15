@@ -3,31 +3,33 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from gpu_queue.domain import Job, QueueState
 
 
-def empty_queue() -> dict[str, list]:
+def empty_queue() -> QueueState:
     return {"staging": [], "pending": [], "running": [], "completed": []}
 
 
-def normalize_queue(raw: Any) -> dict[str, list]:
+def normalize_queue(raw: Any) -> QueueState:
     queue = empty_queue()
     if not isinstance(raw, dict):
         return queue
     for key in queue:
         val = raw.get(key, [])
-        queue[key] = val if isinstance(val, list) else []
+        queue[key] = cast(list[Job], val if isinstance(val, list) else [])
     return queue
 
 
-def load_queue_file(queue_file: Path) -> dict[str, list]:
+def load_queue_file(queue_file: Path) -> QueueState:
     if not queue_file.exists() or queue_file.stat().st_size == 0:
         return empty_queue()
     with open(queue_file) as f:
         return normalize_queue(json.load(f))
 
 
-def save_queue_file(queue_file: Path, queue: dict[str, list]) -> None:
+def save_queue_file(queue_file: Path, queue: QueueState) -> None:
     queue_file.parent.mkdir(parents=True, exist_ok=True)
     temp_file = queue_file.with_suffix(".tmp")
     with open(temp_file, "w") as f:
@@ -35,7 +37,7 @@ def save_queue_file(queue_file: Path, queue: dict[str, list]) -> None:
     temp_file.replace(queue_file)
 
 
-def make_staged_job(job_id: str, cmd: str = "", gpus: int = 1) -> dict[str, Any]:
+def make_staged_job(job_id: str, cmd: str = "", gpus: int = 1) -> Job:
     now = datetime.now().isoformat()
     return {
         "id": job_id,
@@ -46,15 +48,15 @@ def make_staged_job(job_id: str, cmd: str = "", gpus: int = 1) -> dict[str, Any]
     }
 
 
-def insert_staged_job(queue: dict[str, list], job: dict[str, Any]) -> None:
+def insert_staged_job(queue: QueueState, job: Job) -> None:
     queue["staging"].insert(0, job)
 
 
-def stage_completed_job(queue: dict[str, list], job: dict[str, Any]) -> None:
+def stage_completed_job(queue: QueueState, job: Job) -> None:
     queue["staging"].insert(0, job)
 
 
-def send_staged_job_to_pending(queue: dict[str, list], job_id: str) -> bool:
+def send_staged_job_to_pending(queue: QueueState, job_id: str) -> bool:
     for i, job in enumerate(queue["staging"]):
         if job["id"] == job_id:
             moved = queue["staging"].pop(i)
@@ -64,7 +66,7 @@ def send_staged_job_to_pending(queue: dict[str, list], job_id: str) -> bool:
     return False
 
 
-def move_pending_job_to_staging(queue: dict[str, list], job_id: str) -> bool:
+def move_pending_job_to_staging(queue: QueueState, job_id: str) -> bool:
     for i, job in enumerate(queue["pending"]):
         if job["id"] == job_id:
             moved = queue["pending"].pop(i)
@@ -76,7 +78,7 @@ def move_pending_job_to_staging(queue: dict[str, list], job_id: str) -> bool:
     return False
 
 
-def cancel_staged_job(queue: dict[str, list], job_id: str) -> bool:
+def cancel_staged_job(queue: QueueState, job_id: str) -> bool:
     for i, job in enumerate(queue["staging"]):
         if job["id"] == job_id:
             cancelled = queue["staging"].pop(i)
@@ -87,9 +89,7 @@ def cancel_staged_job(queue: dict[str, list], job_id: str) -> bool:
     return False
 
 
-def stage_completed_retry(
-    queue: dict[str, list], job_id: str, new_job: dict[str, Any]
-) -> bool:
+def stage_completed_retry(queue: QueueState, job_id: str, new_job: Job) -> bool:
     for i, job in enumerate(queue["completed"]):
         if job["id"] == job_id:
             queue["completed"].pop(i)
@@ -98,7 +98,7 @@ def stage_completed_retry(
     return False
 
 
-def move_pending_job(queue: dict[str, list], job_id: str, offset: int) -> bool:
+def move_pending_job(queue: QueueState, job_id: str, offset: int) -> bool:
     pending = queue["pending"]
     idx = -1
     for i, job in enumerate(pending):
@@ -114,7 +114,7 @@ def move_pending_job(queue: dict[str, list], job_id: str, offset: int) -> bool:
     return True
 
 
-def move_pending_jobs(queue: dict[str, list], job_ids: list[str], offset: int) -> bool:
+def move_pending_jobs(queue: QueueState, job_ids: list[str], offset: int) -> bool:
     """Move multiple pending jobs together by one row, preserving relative order."""
     if offset not in (-1, 1):
         return False
