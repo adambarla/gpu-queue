@@ -278,3 +278,24 @@ class QueueCoreTest(unittest.TestCase):
 
         data = mod.load_queue_raw()
         self.assertEqual([j["cmd"] for j in data["pending"]], ["cmd-b", "cmd-a"])
+
+    def test_cmd_retry_requeues_completed_job_and_preserves_id(self):
+        self.write_queue(
+            {
+                "staging": [],
+                "pending": [],
+                "running": [],
+                "completed": [
+                    {**_job("c1", cmd="old-cmd", gpus=3), "status": "failed"}
+                ],
+            }
+        )
+        args = type("Args", (), {"job_id": "c1", "front": True})()
+
+        mod.cmd_retry(args)
+
+        data = mod.load_queue_raw()
+        self.assertEqual(data["completed"], [])
+        self.assertEqual(data["pending"][0]["id"], "c1")
+        self.assertEqual(data["pending"][0]["cmd"], "old-cmd")
+        self.assertEqual(data["pending"][0]["gpus"], 3)

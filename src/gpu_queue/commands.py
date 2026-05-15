@@ -10,6 +10,7 @@ from gpu_queue import paths
 from gpu_queue.ids import generate_job_id
 from gpu_queue.logs import log_msg
 from gpu_queue.scheduler import daemon_loop, is_daemon_running
+from gpu_queue.service import QueueService
 from gpu_queue.storage import ensure_dirs, locked_queue
 
 
@@ -37,24 +38,12 @@ def cmd_serve(args) -> None:
 
 def cmd_add(args) -> None:
     """Add a job to the queue."""
-    priorities = {"low": 0, "medium": 1, "high": 2}
-    prio = priorities.get(args.priority, 1)
-    if args.front:
-        prio = 3
-
-    job = {
-        "id": generate_job_id(),
-        "cmd": args.command,
-        "gpus": args.gpus,
-        "added": datetime.now().isoformat(),
-        "priority": prio,
-    }
-
-    with locked_queue() as queue:
-        if args.front:
-            queue["pending"].insert(0, job)
-        else:
-            queue["pending"].append(job)
+    job = QueueService().add_job(
+        command=args.command,
+        gpus=args.gpus,
+        priority=args.priority,
+        front=args.front,
+    )
 
     print(f"✓ Added job {job['id']} (requires {args.gpus} GPUs)")
     print(f"  Command: {args.command}")
@@ -171,27 +160,11 @@ def cmd_delete(args) -> None:
 
 def cmd_retry(args) -> None:
     """Re-queue a completed job."""
-    with locked_queue() as queue:
-        for i, job in enumerate(queue["completed"]):
-            if job["id"] == args.job_id:
-                queue["completed"].pop(i)
-
-                new_job = {
-                    "id": job["id"],
-                    "cmd": job["cmd"],
-                    "gpus": job.get("gpus", 1),
-                    "added": datetime.now().isoformat(),
-                    "retried_at": datetime.now().isoformat(),
-                    "priority": 1,
-                }
-
-                if args.front:
-                    queue["pending"].insert(0, new_job)
-                    print(f"✓ Re-queued job {job['id']} (front)")
-                else:
-                    queue["pending"].append(new_job)
-                    print(f"✓ Re-queued job {job['id']} (back)")
-                return
+    new_job = QueueService().requeue_completed(args.job_id, front=args.front)
+    if new_job is not None:
+        where = "front" if args.front else "back"
+        print(f"✓ Re-queued job {new_job['id']} ({where})")
+        return
 
     print(f"Job {args.job_id} not found in completed jobs")
 
