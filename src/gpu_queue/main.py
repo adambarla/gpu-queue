@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, cast
 
+from gpu_queue.gpu import get_available_gpu_indices, get_free_gpus
 from gpu_queue.logs import log_msg
 from gpu_queue.paths import (
     DAEMON_LOG,
@@ -53,6 +54,12 @@ from gpu_queue.queue_state import (
     send_staged_job_to_pending,
     stage_completed_retry,
 )
+from gpu_queue.scheduler import (
+    cleanup_dead_jobs,
+    daemon_loop,
+    is_daemon_running,
+    run_job,
+)
 from gpu_queue.storage import (
     ensure_dirs,
     load_queue,
@@ -67,8 +74,14 @@ __all__ = [
     "MIN_FREE_GPUS",
     "QUEUE_FILE",
     "SERVER_PORT",
+    "cleanup_dead_jobs",
+    "daemon_loop",
+    "get_available_gpu_indices",
+    "get_free_gpus",
     "get_server_url",
+    "is_daemon_running",
     "load_queue_raw",
+    "run_job",
     "save_queue",
     "save_queue_raw",
 ]
@@ -98,348 +111,6 @@ def generate_job_id() -> str:
 
     ts = datetime.now().isoformat()
     return hashlib.md5(ts.encode()).hexdigest()[:8]
-
-
-def get_free_gpus() -> list[dict[str, Any]]:
-    """Get list of GPUs with their status (free = no processes running)."""
-    try:
-        # First get basic GPU info
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,memory.total,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        gpus = {}
-        for line in result.stdout.strip().split("\n"):
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 3:
-                idx = int(parts[0])
-                used = int(parts[1])
-                total = int(parts[2])
-                util = 0
-                if len(parts) >= 4 and parts[3].strip().isdigit():
-                    util = int(parts[3].strip())
-
-                gpus[idx] = {
-                    "index": idx,
-                    "used_mb": used,
-                    "total_mb": total,
-                    "util": util,
-                    "free": True,  # Assume free, will mark busy if processes found
-                    "processes": [],  # List of process info dicts
-                }
-
-        # Get GPU index to UUID mapping
-        uuid_result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,uuid",
-                "--format=csv,noheader",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        uuid_to_idx = {}
-        for line in uuid_result.stdout.strip().split("\n"):
-            if "," in line:
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2:
-                    uuid_to_idx[parts[1]] = int(parts[0])
-
-        # Get process details
-        proc_result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # Mark GPUs with processes as busy and collect process info
-        for line in proc_result.stdout.strip().split("\n"):
-            if "," in line:
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 4:
-                    gpu_uuid, pid_str, proc_name, mem_str = (
-                        parts[0],
-                        parts[1],
-                        parts[2],
-                        parts[3],
-                    )
-                    if gpu_uuid in uuid_to_idx:
-                        idx = uuid_to_idx[gpu_uuid]
-                        if idx in gpus:
-                            # Check if it's a zombie (process doesn't exist)
-                            is_zombie = proc_name == "[Not Found]"
-                            if not is_zombie:
-                                # Verify the PID actually exists using /proc
-                                try:
-                                    pid = int(pid_str)
-                                    if not Path(f"/proc/{pid}").exists():
-                                        is_zombie = True
-                                except ValueError:
-                                    is_zombie = True
-
-                            # Extract user from process path
-                            user = "unknown"
-                            if "/home/" in proc_name:
-                                user = proc_name.split("/home/")[1].split("/")[0]
-                            elif is_zombie:
-                                user = "zombie"
-
-                            gpus[idx]["processes"].append(
-                                {
-                                    "pid": pid_str,
-                                    "user": user,
-                                    "name": proc_name.split("/")[-1]
-                                    if "/" in proc_name
-                                    else proc_name,
-                                    "mem_mb": int(mem_str) if mem_str.isdigit() else 0,
-                                    "zombie": is_zombie,
-                                }
-                            )
-
-                            # Only mark as busy if NOT a zombie
-                            if not is_zombie:
-                                gpus[idx]["free"] = False
-
-        return list(gpus.values())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-
-
-def get_available_gpu_indices() -> list[int]:
-    """Get indices of free GPUs (excluding running jobs)."""
-    gpus = get_free_gpus()
-    free_indices = [g["index"] for g in gpus if g["free"]]
-
-    # Also exclude GPUs already assigned to running jobs (race condition protection)
-    queue = load_queue()
-    reserved_gpus = set()
-    for job in queue.get("running", []):
-        for gpu_idx in job.get("assigned_gpus", []):
-            reserved_gpus.add(gpu_idx)
-
-    return [idx for idx in free_indices if idx not in reserved_gpus]
-
-
-def is_daemon_running() -> bool:
-    """Check if scheduler is running (placeholder)."""
-    # For now, just return True to avoid warnings, or implement a real check.
-    return True
-
-
-def cleanup_dead_jobs():
-    """Check running jobs and move dead ones to completed with status classification."""
-    with locked_queue() as queue:
-        still_running = []
-        changed = False
-
-        for job in queue["running"]:
-            pid = job.get("pid")
-            if pid:
-                # Check if process is still running
-                proc_path = Path(f"/proc/{pid}")
-                if proc_path.exists():
-                    still_running.append(job)
-                    continue
-
-                # Process is dead. Wait for exit file.
-                job["ended"] = datetime.now().isoformat()
-                exit_file = QUEUE_DIR / f"{job['id']}.exit"
-
-                # Wait up to 1s for exit file to appear (shell might be finishing up)
-                status = "unknown"
-                for _ in range(10):
-                    if exit_file.exists():
-                        try:
-                            code = int(exit_file.read_text().strip())
-                            status = "success" if code == 0 else "failed"
-                            break
-                        except Exception:
-                            pass
-                    time.sleep(0.1)
-
-                if status == "unknown":
-                    status = "killed"
-
-                job["status"] = status
-                queue["completed"].append(job)
-                if exit_file.exists():
-                    exit_file.unlink(missing_ok=True)
-                changed = True
-            else:
-                still_running.append(job)
-
-        if changed:
-            queue["running"] = still_running
-        else:
-            # No changes needed, queue remains unchanged.
-            pass
-
-
-def run_job(job: dict, gpu_indices: list[int]) -> int:
-    """Run a job with the specified GPUs. Returns the PID."""
-    log_file = LOG_DIR / f"{job['id']}.log"
-    exit_file = QUEUE_DIR / f"{job['id']}.exit"
-    gpu_str = ",".join(map(str, gpu_indices))
-
-    # Normalize command: collapse any newlines/whitespace to single line
-    cmd = " ".join(job["cmd"].split())
-
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = gpu_str
-    # Ensure ~/.local/bin is in PATH for uv
-    local_bin = str(Path.home() / ".local" / "bin")
-    if local_bin not in env.get("PATH", ""):
-        env["PATH"] = f"{local_bin}:{env.get('PATH', '')}"
-
-    with open(log_file, "w") as f:
-        f.write(f"=== Job {job['id']} ===\n")
-        f.write(f"Command: {cmd}\n")
-        f.write(f"GPUs: {gpu_str}\n")
-        f.write(f"Started: {datetime.now().isoformat()}\n")
-        f.write("=" * 40 + "\n\n")
-
-    # Wrap in shell to capture exit code. Quote paths to be safe.
-    q_log = f"'{log_file}'"
-    q_exit = f"'{exit_file}'"
-    wrapped_cmd = f"({cmd}) >> {q_log} 2>&1; echo $? > {q_exit}"
-
-    proc = subprocess.Popen(
-        wrapped_cmd,
-        shell=True,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=Path.home() / "pepo",
-        start_new_session=True,
-    )
-
-    return proc.pid
-
-
-def _running_gpu_usage(job: dict) -> int:
-    assigned = job.get("assigned_gpus", [])
-    if assigned:
-        return len(assigned)
-    return int(job.get("gpus", 1))
-
-
-def daemon_loop(min_free, excluded_gpus=None, max_use: Optional[int] = None):
-    """Main scheduler loop."""
-    if excluded_gpus is None:
-        excluded_gpus = set()
-
-    while True:
-        try:
-            cleanup_dead_jobs()
-
-            with locked_queue() as queue:
-                if queue["pending"]:
-                    # --- Quota and Availability Logic ---
-                    all_gpus = get_free_gpus()
-
-                    # Filter out excluded GPUs
-                    gpus = [g for g in all_gpus if g["index"] not in excluded_gpus]
-
-                    our_assigned = set()
-                    our_usage = 0
-                    for j in queue["running"]:
-                        our_usage += _running_gpu_usage(j)
-                        for idx in j.get("assigned_gpus", []):
-                            our_assigned.add(idx)
-
-                    actual_free_count = sum(
-                        1
-                        for g in all_gpus
-                        if g["free"] and g["index"] not in our_assigned
-                    )
-                    startable_gpus = max(0, actual_free_count - min_free)
-                    if max_use is not None:
-                        startable_gpus = min(
-                            startable_gpus, max(0, max_use - our_usage)
-                        )
-
-                    # List of GPUs we may assign while preserving actual idle reserve.
-                    free_indices = [
-                        g["index"]
-                        for g in gpus
-                        if g["free"] and g["index"] not in our_assigned
-                    ]
-
-                    if startable_gpus > 0:
-                        # --- Backfilling Scheduler ---
-                        jobs_started = False
-                        remaining_pending = []
-
-                        for job in queue["pending"]:
-                            req = job.get("gpus", 1)
-
-                            if req <= startable_gpus and req <= len(free_indices):
-                                assigned = free_indices[:req]
-                                log_msg(f"Starting job {job['id']} on GPUs {assigned}")
-
-                                pid = run_job(job, assigned)
-
-                                job["pid"] = pid
-                                job["assigned_gpus"] = assigned
-                                job["status"] = "running"
-                                job["started"] = datetime.now().isoformat()
-                                queue["running"].append(job)
-
-                                startable_gpus -= req
-                                free_indices = free_indices[req:]
-                                jobs_started = True
-                            else:
-                                remaining_pending.append(job)
-
-                        if jobs_started:
-                            queue["pending"] = remaining_pending
-
-                    # Save GPU status for TUI
-                    try:
-                        status_data = {
-                            "ts": datetime.now().isoformat(),
-                            "gpus": all_gpus,
-                            "min_free": min_free,
-                            "max_use": max_use,
-                            "excluded": list(excluded_gpus),
-                        }
-                        (QUEUE_DIR / "status.json").write_text(json.dumps(status_data))
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        all_gpus = get_free_gpus()
-                        status_data = {
-                            "ts": datetime.now().isoformat(),
-                            "gpus": all_gpus,
-                            "min_free": min_free,
-                            "max_use": max_use,
-                            "excluded": list(excluded_gpus),
-                        }
-                        (QUEUE_DIR / "status.json").write_text(json.dumps(status_data))
-                    except Exception:
-                        pass
-
-            time.sleep(POLL_INTERVAL)
-
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log_msg(f"Error in daemon loop: {e}")
-            time.sleep(POLL_INTERVAL)
 
 
 def cmd_serve(args):

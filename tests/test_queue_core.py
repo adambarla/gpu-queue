@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gpu_queue import main as mod
-from gpu_queue import paths
+from gpu_queue import paths, scheduler
 
 
 def _job(
@@ -85,14 +85,14 @@ class QueueCoreTest(unittest.TestCase):
         )
 
         with (
-            patch.object(mod, "cleanup_dead_jobs"),
+            patch.object(scheduler, "cleanup_dead_jobs"),
             patch.object(
-                mod,
+                scheduler,
                 "get_free_gpus",
                 return_value=[{"index": 0, "free": True}, {"index": 1, "free": True}],
             ),
-            patch.object(mod, "run_job", return_value=4321),
-            patch.object(mod.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(scheduler, "run_job", return_value=4321),
+            patch.object(scheduler.time, "sleep", side_effect=KeyboardInterrupt),
         ):
             mod.daemon_loop(min_free=1)
 
@@ -119,10 +119,10 @@ class QueueCoreTest(unittest.TestCase):
             {"index": 3, "free": False},
         ]
         with (
-            patch.object(mod, "cleanup_dead_jobs"),
-            patch.object(mod, "get_free_gpus", return_value=gpu_status),
-            patch.object(mod, "run_job", return_value=4321) as run_job,
-            patch.object(mod.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(scheduler, "cleanup_dead_jobs"),
+            patch.object(scheduler, "get_free_gpus", return_value=gpu_status),
+            patch.object(scheduler, "run_job", return_value=4321) as run_job,
+            patch.object(scheduler.time, "sleep", side_effect=KeyboardInterrupt),
         ):
             mod.daemon_loop(min_free=2)
 
@@ -152,10 +152,10 @@ class QueueCoreTest(unittest.TestCase):
             {"index": 3, "free": True},
         ]
         with (
-            patch.object(mod, "cleanup_dead_jobs"),
-            patch.object(mod, "get_free_gpus", return_value=gpu_status),
-            patch.object(mod, "run_job", return_value=4321),
-            patch.object(mod.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(scheduler, "cleanup_dead_jobs"),
+            patch.object(scheduler, "get_free_gpus", return_value=gpu_status),
+            patch.object(scheduler, "run_job", return_value=4321),
+            patch.object(scheduler.time, "sleep", side_effect=KeyboardInterrupt),
         ):
             mod.daemon_loop(min_free=0, max_use=2)
 
@@ -189,10 +189,10 @@ class QueueCoreTest(unittest.TestCase):
             {"index": 3, "free": True},
         ]
         with (
-            patch.object(mod, "cleanup_dead_jobs"),
-            patch.object(mod, "get_free_gpus", return_value=gpu_status),
-            patch.object(mod, "run_job", return_value=4321),
-            patch.object(mod.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(scheduler, "cleanup_dead_jobs"),
+            patch.object(scheduler, "get_free_gpus", return_value=gpu_status),
+            patch.object(scheduler, "run_job", return_value=4321),
+            patch.object(scheduler.time, "sleep", side_effect=KeyboardInterrupt),
         ):
             mod.daemon_loop(min_free=0, max_use=2)
 
@@ -218,10 +218,10 @@ class QueueCoreTest(unittest.TestCase):
             {"index": 3, "free": True},
         ]
         with (
-            patch.object(mod, "cleanup_dead_jobs"),
-            patch.object(mod, "get_free_gpus", return_value=gpu_status),
-            patch.object(mod, "run_job", return_value=4321),
-            patch.object(mod.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(scheduler, "cleanup_dead_jobs"),
+            patch.object(scheduler, "get_free_gpus", return_value=gpu_status),
+            patch.object(scheduler, "run_job", return_value=4321),
+            patch.object(scheduler.time, "sleep", side_effect=KeyboardInterrupt),
         ):
             mod.daemon_loop(min_free=1, excluded_gpus={0})
 
@@ -248,10 +248,10 @@ class QueueCoreTest(unittest.TestCase):
             {"index": 3, "free": True},
         ]
         with (
-            patch.object(mod, "cleanup_dead_jobs"),
-            patch.object(mod, "get_free_gpus", return_value=gpu_status),
-            patch.object(mod, "run_job", return_value=4321),
-            patch.object(mod.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(scheduler, "cleanup_dead_jobs"),
+            patch.object(scheduler, "get_free_gpus", return_value=gpu_status),
+            patch.object(scheduler, "run_job", return_value=4321),
+            patch.object(scheduler.time, "sleep", side_effect=KeyboardInterrupt),
         ):
             mod.daemon_loop(min_free=1, excluded_gpus={0})
 
