@@ -87,7 +87,9 @@ def cancel_staged_job(queue: dict[str, list], job_id: str) -> bool:
     return False
 
 
-def stage_completed_retry(queue: dict[str, list], job_id: str, new_job: dict[str, Any]) -> bool:
+def stage_completed_retry(
+    queue: dict[str, list], job_id: str, new_job: dict[str, Any]
+) -> bool:
     for i, job in enumerate(queue["completed"]):
         if job["id"] == job_id:
             queue["completed"].pop(i)
@@ -122,7 +124,9 @@ def move_pending_jobs(queue: dict[str, list], job_ids: list[str], offset: int) -
 
     wanted = {str(job_id) for job_id in job_ids}
     indexed = [
-        i for i, job in enumerate(pending) if job.get("id") is not None and str(job.get("id")) in wanted
+        i
+        for i, job in enumerate(pending)
+        if job.get("id") is not None and str(job.get("id")) in wanted
     ]
     if not indexed:
         return False
